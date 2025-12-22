@@ -1,21 +1,28 @@
 #!/bin/bash
-# ==================================================
-# VPS Traffic Spirit
-# Version: 0.0.1
+# ==============================================================================
+# VPS Traffic Spirit v1.0.0
 # Author: Prince 2025.12
-# ==================================================
+# ==============================================================================
 
-# --- 基础路径配置 ---
-BASE_DIR="/root/vps_traffic"
-CONF_FILE="$BASE_DIR/config.conf"
-STATS_FILE="$BASE_DIR/stats.conf"
-LOG_DIR="$BASE_DIR/logs"
-LOCK_FILE="$BASE_DIR/run.lock"
-BG_PID_FILE="$BASE_DIR/bg_task.pid"
-SCRIPT_PATH=$(readlink -f "$0")
-CRON_MARK="# VPS_TRAFFIC_SPIRIT_PRINCE"
+# --- [环境与路径] ---
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+SCRIPT_NAME=$(basename "$0")
+SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_NAME"
 
-# --- 颜色定义 ---
+CONF_FILE="$SCRIPT_DIR/traffic_config.conf"
+STATS_FILE="$SCRIPT_DIR/traffic_stats.conf"
+LOG_DIR="$SCRIPT_DIR/logs"
+
+# 进程锁与PID
+LOCK_DAILY="$SCRIPT_DIR/daily.lock"
+LOCK_HOURLY="$SCRIPT_DIR/hourly.lock"
+STATS_LOCK="$SCRIPT_DIR/stats.lock"
+BG_PID_FILE="$SCRIPT_DIR/bg.pid"
+
+# Cron 标记 (关键：用于识别和清理)
+CRON_MARK="# [VPS_TRAFFIC_SPIRIT_V3]"
+
+# 颜色
 RED='\033[31m'
 GREEN='\033[32m'
 YELLOW='\033[33m'
@@ -23,88 +30,72 @@ BLUE='\033[36m'
 PLAIN='\033[0m'
 BOLD='\033[1m'
 
-mkdir -p "$BASE_DIR" "$LOG_DIR"
+mkdir -p "$LOG_DIR"
 
-# ======================
-# 1. 默认配置 (Prince 定制版)
-# ======================
-# 周期策略: 28天跑36GB
-PERIOD_DAYS=28
+# ==============================================================================
+# 1. 默认策略配置
+# ==============================================================================
+
+# [A] 周期保底
+PERIOD_DAYS=22
 PERIOD_TARGET_GB=36
 PERIOD_START_DATE="$(date +%F)"
 
-# 每日策略: 1200MB, 跑120分钟, 最大12MB/s
-DAILY_TARGET_MB=1200
+# [B] 每日任务 (Cron)
+DAILY_TARGET_MB=1210
 DAILY_TIME_MIN=120
-CRON_MAX_SPEED_MB=12
-
-# 调度时间: 北京时间 03:20
+CRON_MAX_SPEED_MB=8
 BJ_CRON_HOUR=3
-BJ_CRON_MIN=20
+BJ_CRON_MIN=10
 
-# 系统安全: 默认关闭上传，内存低位保护
+# [C] 小时任务 (Hourly)
+ENABLE_HOURLY=0
+HOURLY_INTERVAL_MIN=91
+HOURLY_TARGET_MB=150
+HOURLY_DURATION_MIN=2
+HOURLY_BJ_START=8
+HOURLY_BJ_END=18
+
+# [D] 系统参数
 ENABLE_UPLOAD=0
 UPLOAD_RATIO=10
 MEM_PROTECT_KB=262144
-
-# 节点策略: 随机
 NODE_STRATEGY=3
-FIXED_REGION="nbg1"
-ROUND_IDX=0
+JITTER_PERCENT=15
 
-# ======================
-# 2. 工具函数
-# ======================
+# ==============================================================================
+# 2. 核心工具
+# ==============================================================================
 now_sec() { date +%s; }
 mb_to_kb() { awk "BEGIN{printf \"%.0f\", $1 * 1024}"; }
 kb_to_mb() { awk "BEGIN{printf \"%.2f\", $1 / 1024}"; }
 kb_to_gb() { awk "BEGIN{printf \"%.2f\", $1 / 1024 / 1024}"; }
+gb_to_kb() { awk "BEGIN{printf \"%.0f\", $1 * 1024 * 1024}"; }
 
 log() {
     local ts="$(date '+%F %T')"
-    echo -e "[$ts] $*" >> "$LOG_DIR/traffic.log"
-    # 非后台且非Cron模式下，输出到屏幕
-    if [ "$IS_BACKGROUND" != "1" ] && [ "$IS_CRON" != "1" ]; then
-        echo -e "[$ts] $*"
+    echo -e "[$ts] $*" >> "$LOG_DIR/system.log"
+    if [ "$IS_SILENT" != "1" ]; then echo -e "[$ts] $*"; fi
+}
+
+check_env() {
+    local fix=0
+    if ! command -v crontab >/dev/null 2>&1; then fix=1; fi
+    if ! command -v curl >/dev/null 2>&1; then fix=1; fi
+    if [ "$fix" -eq 1 ]; then
+        echo -e "${YELLOW}修复依赖...${PLAIN}"
+        if [ -f /etc/debian_version ]; then apt-get update -y -q && apt-get install -y -q cron curl; fi
+        if [ -f /etc/redhat-release ]; then yum install -y -q cronie curl; fi
+        if [ -f /etc/alpine-release ]; then apk add cronie curl; fi
+    fi
+    if [ -f /etc/alpine-release ]; then pgrep crond >/dev/null || crond; else
+        service cron start 2>/dev/null || systemctl start cron 2>/dev/null || systemctl start crond 2>/dev/null
     fi
 }
 
-rotate_logs() { find "$LOG_DIR" -name "*.log" -mtime +5 -delete; }
-
-check_resources() {
-    local disk=$(df "$BASE_DIR" | awk 'NR==2 {print $4}')
-    [ "$disk" -lt 102400 ] && { log "${RED}磁盘空间不足，停止运行。${PLAIN}"; exit 1; }
-    
-    if [ "$ENABLE_UPLOAD" = "1" ]; then
-        local mem=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
-        [ -z "$mem" ] && mem=$(free | awk '/Mem:/ {print $4+$6}')
-        if [ "$mem" -lt "$MEM_PROTECT_KB" ]; then
-            log "${YELLOW}内存紧张 ($mem KB)，自动关闭上传以防掉线。${PLAIN}"
-            ENABLE_UPLOAD=0
-        fi
-    fi
-}
-
-# ======================
-# 3. 核心测速功能 (新增)
-# ======================
-measure_max_speed() {
-    echo -e "${YELLOW}正在测试网络极限带宽 (耗时约 10 秒)...${PLAIN}"
-    # 使用 Hetzner 10GB 文件测速 10秒，获取平均下载速度
-    # -w "%{speed_download}" 输出单位是 bytes/sec
-    local speed_bps=$(curl -s -w "%{speed_download}" -o /dev/null --max-time 10 "https://nbg1-speed.hetzner.com/10GB.bin")
-    
-    # 转换为 MB/s
-    local speed_mb=$(awk "BEGIN {printf \"%.2f\", $speed_bps / 1024 / 1024}")
-    
-    echo -e "${GREEN}>>> 测试完成!${PLAIN}"
-    echo -e "当前网络最大平均速度: ${BOLD}${speed_mb} MB/s${PLAIN}"
-    echo -e "建议设置的挂机限速:   ${BOLD}$(awk "BEGIN {printf \"%.0f\", $speed_mb * 0.8}") MB/s${PLAIN} (预留20%带宽)"
-}
-
-# ======================
-# 4. 配置存取
-# ======================
+# ==============================================================================
+# 3. 状态管理
+# ==============================================================================
 load_config() {
     [ -f "$CONF_FILE" ] && source "$CONF_FILE"
     [ -f "$STATS_FILE" ] && source "$STATS_FILE"
@@ -112,9 +103,9 @@ load_config() {
     PERIOD_KB=${PERIOD_KB:-0}
     TODAY_RUN_SEC=${TODAY_RUN_SEC:-0}
     
-    # 强制默认值校验
     PERIOD_DAYS=${PERIOD_DAYS:-28}
-    CRON_MAX_SPEED_MB=${CRON_MAX_SPEED_MB:-12}
+    HOURLY_INTERVAL_MIN=${HOURLY_INTERVAL_MIN:-60}
+    HOURLY_DURATION_MIN=${HOURLY_DURATION_MIN:-15}
 }
 
 save_config() {
@@ -127,339 +118,373 @@ DAILY_TIME_MIN=$DAILY_TIME_MIN
 CRON_MAX_SPEED_MB=$CRON_MAX_SPEED_MB
 BJ_CRON_HOUR=$BJ_CRON_HOUR
 BJ_CRON_MIN=$BJ_CRON_MIN
+ENABLE_HOURLY=$ENABLE_HOURLY
+HOURLY_INTERVAL_MIN=$HOURLY_INTERVAL_MIN
+HOURLY_TARGET_MB=$HOURLY_TARGET_MB
+HOURLY_DURATION_MIN=$HOURLY_DURATION_MIN
+HOURLY_BJ_START=$HOURLY_BJ_START
+HOURLY_BJ_END=$HOURLY_BJ_END
 ENABLE_UPLOAD=$ENABLE_UPLOAD
 UPLOAD_RATIO=$UPLOAD_RATIO
 NODE_STRATEGY=$NODE_STRATEGY
-FIXED_REGION="$FIXED_REGION"
-ROUND_IDX=$ROUND_IDX
+JITTER_PERCENT=$JITTER_PERCENT
 EOF
 }
 
-save_stats() {
-cat >"$STATS_FILE"<<EOF
+update_stats() {
+    local add_kb=$1
+    local add_sec=$2
+    (
+        flock -x 200
+        [ -f "$STATS_FILE" ] && source "$STATS_FILE"
+        TODAY_KB=${TODAY_KB:-0}
+        PERIOD_KB=${PERIOD_KB:-0}
+        TODAY_RUN_SEC=${TODAY_RUN_SEC:-0}
+        TODAY_KB=$(( TODAY_KB + add_kb ))
+        PERIOD_KB=$(( PERIOD_KB + add_kb ))
+        TODAY_RUN_SEC=$(( TODAY_RUN_SEC + add_sec ))
+        cat >"$STATS_FILE"<<EOF
 TODAY_KB=$TODAY_KB
 TODAY_RUN_SEC=$TODAY_RUN_SEC
 PERIOD_KB=$PERIOD_KB
 LAST_RUN_TIME="$(date '+%F %T')"
-LAST_RUN_KB=$LAST_RUN_KB
+LAST_RUN_KB=$add_kb
 EOF
+    ) 200>"$STATS_LOCK"
 }
 
-# ======================
-# 5. 流量执行引擎
-# ======================
-pick_region() {
-    local list="nbg1 fsn1 hel1 ash hil sin"
-    case "$NODE_STRATEGY" in
-        1) echo "$FIXED_REGION" ;;
-        2)
-            local arr=($list)
-            local r=${arr[$ROUND_IDX]}
-            ROUND_IDX=$(( (ROUND_IDX + 1) % ${#arr[@]} ))
-            save_config
-            echo "$r"
-            ;;
-        *) echo "$list" | tr ' ' '\n' | shuf -n1 ;;
-    esac
+# ==============================================================================
+# 4. 智能计算
+# ==============================================================================
+calc_smart_target() {
+    local start_s=$(date -d "$PERIOD_START_DATE" +%s)
+    local passed_days=$(( ( $(now_sec) - start_s ) / 86400 ))
+    [ "$passed_days" -lt 0 ] && passed_days=0
+    local left_days=$(( PERIOD_DAYS - passed_days ))
+    [ "$left_days" -le 0 ] && left_days=1
+
+    local total_kb=$(gb_to_kb "$PERIOD_TARGET_GB")
+    local left_kb=$(( total_kb - PERIOD_KB ))
+    [ "$left_kb" -le 0 ] && left_kb=0
+    local left_mb=$(kb_to_mb "$left_kb")
+
+    local daily_need_mb=$(awk "BEGIN{printf \"%.0f\", $left_mb / $left_days}")
+    local final_target_mb=$DAILY_TARGET_MB
+    
+    # 保底优先
+    if [ "$daily_need_mb" -gt "$DAILY_TARGET_MB" ]; then
+        final_target_mb=$daily_need_mb
+    fi
+
+    # 随机漂浮
+    local float_pct=$(( RANDOM % (JITTER_PERCENT * 2 + 1) + (100 - JITTER_PERCENT) ))
+    final_target_mb=$(awk "BEGIN{printf \"%.0f\", $final_target_mb * $float_pct / 100}")
+
+    echo "$final_target_mb"
 }
 
-run_traffic_task() {
-    local mode="$1"
-    local target_type="$2" # TIME / DATA
-    local target_val="$3"
-    local max_speed_mb="$4"
+check_hourly_window() {
+    local bj_h=$(date -u -d "+8 hours" +%H | sed 's/^0//')
+    [ -z "$bj_h" ] && bj_h=0
+    if [ "$bj_h" -ge "$HOURLY_BJ_START" ] && [ "$bj_h" -le "$HOURLY_BJ_END" ]; then
+        return 0
+    fi
+    return 1
+}
 
-    [ "$mode" == "BG" ] && IS_BACKGROUND=1 || IS_BACKGROUND=0
-    [ "$mode" == "CRON" ] && IS_CRON=1 || IS_CRON=0
-    
-    check_resources
-    rotate_logs
+get_url() {
+    local n=("nbg1" "fsn1" "hel1" "ash" "hil" "sin")
+    echo "https://${n[$((RANDOM % ${#n[@]}))]}-speed.hetzner.com/10GB.bin?r=$RANDOM"
+}
 
-    # 计算基础速率
-    local base_speed_kb=0
-    local jitter_pct=$(( RANDOM % 40 + 80 )) # 速率波动 80%-120%
+# ==============================================================================
+# 5. 流量执行核心 (流量优先)
+# ==============================================================================
+run_traffic() {
+    local mode="$1"        # BG/CRON/HOURLY/MANUAL
+    local type="$2"        # DATA/TIME
+    local val="$3"         # MB or Seconds
+    local limit_speed="$4" # Max Speed MB/s
 
-    if [ "$IS_CRON" == "1" ]; then
-        # Cron 模式：智能计算温和速率
-        local target_kb=$(mb_to_kb "$DAILY_TARGET_MB")
-        local target_sec=$(( DAILY_TIME_MIN * 60 ))
-        [ "$target_sec" -lt 1 ] && target_sec=1
-        
-        # 理论平均速度
-        base_speed_kb=$(awk "BEGIN{printf \"%.0f\", $target_kb / $target_sec}")
-        
-        # 限制硬顶
-        local cap_kb=$(mb_to_kb "$CRON_MAX_SPEED_MB")
-        [ "$base_speed_kb" -gt "$cap_kb" ] && base_speed_kb=$cap_kb
-        # 限制地板 (最小 1MB/s)
-        [ "$base_speed_kb" -lt 1024 ] && base_speed_kb=1024
-    else
-        # 手动/后台模式：直接使用指定速度
-        base_speed_kb=$(mb_to_kb "$max_speed_mb")
+    IS_SILENT=0
+    if [[ "$mode" == "CRON" || "$mode" == "HOURLY" || "$mode" == "BG" ]]; then IS_SILENT=1; fi
+
+    local disk=$(df "$SCRIPT_DIR" | awk 'NR==2 {print $4}')
+    [ "$disk" -lt 102400 ] && { log "${RED}磁盘不足${PLAIN}"; exit 1; }
+    if [ "$ENABLE_UPLOAD" = "1" ]; then
+        local mem=$(free | awk '/Mem:/ {print $4+$6}')
+        if [ "$mem" -lt "$MEM_PROTECT_KB" ]; then
+            log "${YELLOW}内存紧张禁用上传${PLAIN}"; ENABLE_UPLOAD=0
+        fi
     fi
 
-    # 应用随机抖动
-    local run_speed_kb=$(awk "BEGIN{printf \"%.0f\", $base_speed_kb * $jitter_pct / 100}")
-    
-    # 准备连接
-    local region=$(pick_region)
-    local dl_url="https://$region-speed.hetzner.com/10GB.bin?r=$RANDOM"
-    local up_url="https://$region-speed.hetzner.com/upload"
-    
-    local up_speed_kb=0
-    if [ "$ENABLE_UPLOAD" == "1" ]; then
-        up_speed_kb=$(awk "BEGIN{printf \"%.0f\", $run_speed_kb * $UPLOAD_RATIO / 100}")
-        # 上传硬限制 5MB/s
-        [ "$up_speed_kb" -gt 5120 ] && up_speed_kb=5120
+    # --- 速率计算 ---
+    local speed_kb=$(mb_to_kb "$limit_speed")
+    local calculated_speed_kb=0
+
+    if [ "$type" == "DATA" ]; then
+        local target_kb=$(mb_to_kb "$val")
+        if [ "$mode" == "CRON" ]; then
+            local t_sec=$(( DAILY_TIME_MIN * 60 ))
+            [ "$t_sec" -lt 60 ] && t_sec=60
+            calculated_speed_kb=$(awk "BEGIN{printf \"%.0f\", $target_kb / $t_sec}")
+        elif [ "$mode" == "HOURLY" ]; then
+            local t_sec=$(( HOURLY_DURATION_MIN * 60 ))
+            [ "$t_sec" -lt 60 ] && t_sec=60
+            calculated_speed_kb=$(awk "BEGIN{printf \"%.0f\", $target_kb / $t_sec}")
+        elif [ "$mode" == "MANUAL" ] || [ "$mode" == "BG" ]; then
+            calculated_speed_kb=$speed_kb
+        fi
+
+        if [[ "$mode" == "CRON" || "$mode" == "HOURLY" ]]; then
+            local cap_kb=$(mb_to_kb "$CRON_MAX_SPEED_MB")
+            [ "$calculated_speed_kb" -gt "$cap_kb" ] && calculated_speed_kb=$cap_kb
+        fi
+        [ "$calculated_speed_kb" -lt 1024 ] && calculated_speed_kb=1024
+        speed_kb=$calculated_speed_kb
     fi
 
-    log "任务启动 [$mode]: 目标 ${target_type}=${target_val} | 限速 $(kb_to_mb $run_speed_kb)MB/s | 节点 $region"
-
-    trap 'kill $PID_DL $PID_UP 2>/dev/null; rm -f "$BG_PID_FILE"; exit' EXIT INT TERM
-
-    # 启动下载 (nice -n 10 低优先级)
-    nice -n 10 curl -4 -sL --limit-rate "${run_speed_kb}k" --output /dev/null "$dl_url" &
-    PID_DL=$!
-
-    if [ "$up_speed_kb" -gt 0 ]; then
-        nice -n 15 curl -4 -sL -X POST --limit-rate "${up_speed_kb}k" --data-binary @/dev/zero "$up_url" --output /dev/null &
-        PID_UP=$!
-    fi
-
+    log "任务[$mode]: 目标=$val$( [ "$type" == "DATA" ] && echo "MB" || echo "s" ) | 限速=$(kb_to_mb $speed_kb)MB/s"
+    
     local start_ts=$(now_sec)
-    local cycle_kb=0
+    local current_kb=0
     
-    # 监控循环
+    trap 'kill $PID 2>/dev/null; rm -f "$BG_PID_FILE"; exit' EXIT INT TERM
+
+    # --- 循环直到达标 ---
     while true; do
-        sleep 2
-        local now=$(now_sec)
-        local elapsed=$(( now - start_ts ))
-
-        if ! kill -0 $PID_DL 2>/dev/null; then
-            log "${RED}下载进程意外结束。${PLAIN}"
-            break
-        fi
+        local run_speed=$(awk "BEGIN{printf \"%.0f\", $speed_kb * $(( RANDOM % 21 + 90 )) / 100}")
+        local url=$(get_url)
         
-        # 估算流量 (每2秒)
-        local tick_kb=$(( (run_speed_kb + up_speed_kb) * 2 ))
-        cycle_kb=$(( cycle_kb + tick_kb ))
-
-        # 检查结束条件
-        local is_done=0
-        local percent=0
+        nice -n 10 curl -4 -sL --max-time 300 --connect-timeout 15 --limit-rate "${run_speed}k" --output /dev/null "$url" &
+        PID=$!
         
-        if [ "$target_type" == "TIME" ]; then
-            [ "$elapsed" -ge "$target_val" ] && is_done=1
-            percent=$(( elapsed * 100 / target_val ))
-        elif [ "$target_type" == "DATA" ]; then
-            local target_kb=$(mb_to_kb "$target_val")
-            [ "$cycle_kb" -ge "$target_kb" ] && is_done=1
-            percent=$(( cycle_kb * 100 / target_kb ))
-        fi
-        [ "$percent" -gt 100 ] && percent=100
-
-        # 前台显示进度
-        if [ "$IS_BACKGROUND" != "1" ] && [ "$IS_CRON" != "1" ]; then
-             local mb_run=$(kb_to_mb $cycle_kb)
-             echo -ne "\r[Running] 进度: ${percent}% | 已跑: ${mb_run} MB | 时间: ${elapsed}s | 瞬时: ~$(kb_to_mb $run_speed_kb) MB/s  "
+        local PID_UP=""
+        if [ "$ENABLE_UPLOAD" == "1" ]; then
+            local u_speed=$(awk "BEGIN{printf \"%.0f\", $run_speed * $UPLOAD_RATIO / 100}")
+            [ "$u_speed" -gt 5120 ] && u_speed=5120
+            if [ "$u_speed" -gt 0 ]; then
+                nice -n 15 curl -4 -sL --max-time 300 --limit-rate "${u_speed}k" --data-binary @/dev/zero "${url%10GB.bin*}upload" --output /dev/null &
+                PID_UP=$!
+            fi
         fi
 
-        if [ "$is_done" -eq 1 ]; then
-            [ "$IS_BACKGROUND" != "1" ] && [ "$IS_CRON" != "1" ] && echo -e "\n${GREEN}目标达成，任务结束。${PLAIN}"
-            break
-        fi
+        while kill -0 $PID 2>/dev/null; do
+            sleep 2
+            local elapsed=$(( $(now_sec) - start_ts ))
+            local tick=$(( run_speed * 2 ))
+            [ -n "$PID_UP" ] && tick=$(( tick + u_speed * 2 ))
+            current_kb=$(( current_kb + tick ))
+            
+            local done=0
+            local pct=0
+            if [ "$type" == "TIME" ]; then
+                [ "$elapsed" -ge "$val" ] && done=1
+                pct=$(( elapsed * 100 / val ))
+            else
+                local target_kb=$(mb_to_kb "$val")
+                [ "$current_kb" -ge "$target_kb" ] && done=1
+                pct=$(( current_kb * 100 / target_kb ))
+            fi
+            [ "$pct" -gt 100 ] && pct=100
+
+            if [ "$IS_SILENT" == "0" ]; then
+                echo -ne "\r[Running] 进度:${pct}% | 已跑:$(kb_to_mb $current_kb)MB | 速率:~$(kb_to_mb $run_speed)MB/s  "
+            fi
+            
+            if [ "$done" -eq 1 ]; then
+                kill $PID $PID_UP 2>/dev/null
+                break 2
+            fi
+        done
+        kill $PID $PID_UP 2>/dev/null
+        wait $PID $PID_UP 2>/dev/null
+
+        if [ "$IS_SILENT" == "1" ]; then sleep $(( RANDOM % 20 + 5 )); fi
     done
 
-    # 结算
-    kill $PID_DL $PID_UP 2>/dev/null
-    wait $PID_DL $PID_UP 2>/dev/null
-    trap - EXIT INT TERM
-    
-    TODAY_KB=$(( TODAY_KB + cycle_kb ))
-    PERIOD_KB=$(( PERIOD_KB + cycle_kb ))
-    TODAY_RUN_SEC=$(( TODAY_RUN_SEC + (now_sec - start_ts) ))
-    LAST_RUN_KB=$cycle_kb
-    
-    save_stats
-    log "任务完成: 产生流量 $(kb_to_mb $cycle_kb) MB"
+    local dur=$(( $(now_sec) - start_ts ))
+    update_stats "$current_kb" "$dur"
+    if [ "$IS_SILENT" == "0" ]; then echo -e "\n${GREEN}任务完成。${PLAIN}"; fi
+    log "完成[$mode]: 流量=$(kb_to_mb $current_kb)MB 耗时=${dur}s"
     rm -f "$BG_PID_FILE"
 }
 
-# ======================
-# 6. Cron 调度 (时区自适应)
-# ======================
-calc_cron_time() {
-    local bj_h=$1
-    local bj_m=$2
-    # 获取本地时区偏移
-    local tz_offset=$(date +%z) # 例如 +0800
-    local svr_offset_h=$(echo ${tz_offset:0:3} | sed 's/^+//')
-    
-    # 算法: 本地时间 = 北京时间(UTC+8) - 8 + 本地偏移
-    local svr_h=$(( bj_h - 8 + svr_offset_h ))
-    
-    # 循环修正 0-23
+# ==============================================================================
+# 6. 调度与卸载
+# ==============================================================================
+install_cron() {
+    check_env
+    local offset=$(date +%z | sed 's/^+//' | cut -c1-3)
+    local svr_h=$(( BJ_CRON_HOUR - 8 + offset ))
     while [ "$svr_h" -lt 0 ]; do svr_h=$(( svr_h + 24 )); done
     while [ "$svr_h" -ge 24 ]; do svr_h=$(( svr_h - 24 )); done
     
-    echo "$svr_h $bj_m"
-}
+    local tmp="$SCRIPT_DIR/cron.tmp"
 
-install_cron() {
-    read -r s_h s_m <<< $(calc_cron_time $BJ_CRON_HOUR $BJ_CRON_MIN)
+    crontab -l 2>/dev/null | grep -F -v "$CRON_MARK" > "$tmp"
     
-    crontab -l 2>/dev/null | grep -v "$CRON_MARK" > /tmp/cron.tmp
-    echo "0 0 * * * $SCRIPT_PATH --daily-reset $CRON_MARK" >> /tmp/cron.tmp
-    echo "$s_m $s_h * * * $SCRIPT_PATH --cron $CRON_MARK" >> /tmp/cron.tmp
-    crontab /tmp/cron.tmp
-    rm -f /tmp/cron.tmp
+    echo "$BJ_CRON_MIN $svr_h * * * $SCRIPT_PATH --cron $CRON_MARK" >> "$tmp"
     
-    echo -e "${GREEN}Cron 已更新！${PLAIN}"
-    echo -e "设定触发 (北京时间): ${YELLOW}$BJ_CRON_HOUR:$BJ_CRON_MIN${PLAIN}"
-    echo -e "实际触发 (本地时间): ${YELLOW}$s_h:$s_m${PLAIN}"
-}
-
-entry_cron() {
-    # 随机延迟 0-10分钟
-    local delay=$(( RANDOM % 600 ))
-    sleep $delay
-    
-    exec 9>"$LOCK_FILE"; flock -n 9 || exit 0
-    load_config
-    
-    # 检查配额
-    if [ "$TODAY_KB" -ge $(mb_to_kb "$DAILY_TARGET_MB") ]; then
-        exit 0
+    if [ "$ENABLE_HOURLY" == "1" ]; then
+        local intv=""
+        if [ "$HOURLY_INTERVAL_MIN" -eq 60 ]; then intv="0 * * * *"; 
+        else intv="*/$HOURLY_INTERVAL_MIN * * * *"; fi
+        echo "$intv $SCRIPT_PATH --hourly $CRON_MARK" >> "$tmp"
     fi
     
-    # Cron 模式运行：类型=DATA, 值=每日目标MB, 速率=0(自动计算)
-    run_traffic_task "CRON" "DATA" "$DAILY_TARGET_MB" "0"
+    crontab "$tmp" && rm -f "$tmp"
+    echo -e "${GREEN}Cron 更新成功!${PLAIN} 每日: 本地$svr_h:$BJ_CRON_MIN | 小时: 每${HOURLY_INTERVAL_MIN}分"
 }
 
-entry_reset() {
-    TODAY_KB=0
-    TODAY_RUN_SEC=0
-    save_stats
-    log "每日统计重置完成"
+uninstall_all() {
+    echo -e "${YELLOW}正在安全卸载...${PLAIN}"
+    # 1. 清理 Cron (关键修复：使用 grep -F)
+    crontab -l 2>/dev/null | grep -F -v "$CRON_MARK" > "$SCRIPT_DIR/cron.clean"
+    crontab "$SCRIPT_DIR/cron.clean"
+    rm -f "$SCRIPT_DIR/cron.clean"
+    
+    # 2. 停止所有相关进程
+    [ -f "$BG_PID_FILE" ] && kill $(cat "$BG_PID_FILE") 2>/dev/null
+    pkill -f "$SCRIPT_NAME" 2>/dev/null
+    
+    # 3. 删除生成文件 (保留脚本本身)
+    rm -f "$CONF_FILE" "$STATS_FILE" "$LOCK_DAILY" "$LOCK_HOURLY" "$STATS_LOCK" "$BG_PID_FILE"
+    rm -rf "$LOG_DIR"
+    
+    echo -e "${GREEN}卸载完成。${PLAIN} (配置与日志已删，脚本文件保留)"
+    exit 0
 }
 
-# ======================
-# 7. 菜单界面 (UI)
-# ======================
-run_bg_wrapper() {
-    nohup "$SCRIPT_PATH" --bg-run "$1" "$2" >/dev/null 2>&1 &
-    echo $! > "$BG_PID_FILE"
-    echo -e "${GREEN}后台任务已启动! PID: $!${PLAIN}"
+# --- 任务入口 ---
+
+entry_cron() {
+    sleep $(( RANDOM % 1800 ))
+    exec 9>"$LOCK_DAILY"; flock -n 9 || exit 0
+    load_config
+    local target=$(calc_smart_target)
+    local ran_mb=$(kb_to_mb "$TODAY_KB")
+    
+    # 保底补齐
+    if [ $(awk "BEGIN{print ($ran_mb < $target)?1:0}") -eq 1 ]; then
+        local todo_mb=$(( target - ran_mb ))
+        [ "$todo_mb" -lt 10 ] && todo_mb=10
+        run_traffic "CRON" "DATA" "$todo_mb" "0"
+    else
+        log "[Cron] 周期保底已达标。"
+    fi
 }
 
-menu_settings() {
+entry_hourly() {
+    sleep $(( RANDOM % 60 ))
+    exec 8>"$LOCK_HOURLY"; flock -n 8 || exit 0
+    load_config
+    if [ "$ENABLE_HOURLY" != "1" ]; then exit 0; fi
+    if ! check_hourly_window; then exit 0; fi
+    run_traffic "HOURLY" "DATA" "$HOURLY_TARGET_MB" "0"
+}
+
+# ==============================================================================
+# 7. 菜单 UI
+# ==============================================================================
+menu() {
     while true; do
-        echo -e "\n${BOLD}--- ⚙️ 参数设置 (By Prince) ---${PLAIN}"
-        echo -e "1. 周期天数     : ${GREEN}$PERIOD_DAYS${PLAIN} 天"
-        echo -e "2. 周期流量目标 : ${GREEN}$PERIOD_TARGET_GB${PLAIN} GB"
-        echo -e "3. 每日流量目标 : ${GREEN}$DAILY_TARGET_MB${PLAIN} MB"
-        echo -e "4. 每日运行时间 : ${GREEN}$DAILY_TIME_MIN${PLAIN} 分钟"
-        echo -e "5. 挂机最大限速 : ${GREEN}$CRON_MAX_SPEED_MB${PLAIN} MB/s (Cron)"
-        echo -e "6. 启动时间(BJ) : ${GREEN}$BJ_CRON_HOUR:$BJ_CRON_MIN${PLAIN}"
-        echo -e "7. 上传开关     : $( [ $ENABLE_UPLOAD -eq 1 ] && echo "${RED}开启${PLAIN}" || echo "${GREEN}关闭${PLAIN}" )"
-        echo -e "----------------------------------"
-        echo -e "T. ⚡ 测试当前最大网速 (辅助设置)"
-        echo -e "0. 保存并返回"
-        echo -e "----------------------------------"
-        read -p "请输入序号修改: " c
+        clear
+        load_config
+        echo -e "${BLUE}=== VPS Traffic Spirit v3.3.0 (Enterprise) ===${PLAIN}"
+        echo -e "${BOLD}[A] 周期保底${PLAIN}"
+        echo -e " 1. 周期天数 : ${GREEN}$PERIOD_DAYS${PLAIN} 天"
+        echo -e " 2. 周期目标 : ${GREEN}$PERIOD_TARGET_GB${PLAIN} GB"
+        echo -e " 3. 周期开始 : $PERIOD_START_DATE"
+        echo -e "${BOLD}[B] 每日任务${PLAIN}"
+        echo -e " 4. 每日目标 : ${GREEN}$DAILY_TARGET_MB${PLAIN} MB"
+        echo -e " 5. 运行时长 : ${GREEN}$DAILY_TIME_MIN${PLAIN} 分"
+        echo -e " 6. 启动时间 : BJ ${GREEN}$BJ_CRON_HOUR:$BJ_CRON_MIN${PLAIN}"
+        echo -e "${BOLD}[C] 小时任务${PLAIN}"
+        echo -e " 7. 任务开关 : $( [ $ENABLE_HOURLY -eq 1 ] && echo "${RED}开启${PLAIN}" || echo "关闭" )"
+        echo -e " 8. 触发间隔 : ${GREEN}$HOURLY_INTERVAL_MIN${PLAIN} 分 | 围栏: BJ ${GREEN}$HOURLY_BJ_START-${HOURLY_BJ_END}${PLAIN}点"
+        echo -e " 9. 每次跑量 : ${GREEN}$HOURLY_TARGET_MB${PLAIN} MB | 耗时: ${GREEN}$HOURLY_DURATION_MIN${PLAIN} 分"
+        echo -e "${BOLD}[D] 系统参数${PLAIN}"
+        echo -e "10. 挂机上限 : ${GREEN}$CRON_MAX_SPEED_MB${PLAIN} MB/s | 上传: $( [ $ENABLE_UPLOAD -eq 1 ] && echo "ON" || echo "OFF" )"
+        echo -e "----------------------------------------------"
+        echo -e " S. 💾 保存配置 | 0. 退出"
+        read -p "选项: " c
         case "$c" in
-            1) read -p "输入周期天数: " v; [ -n "$v" ] && PERIOD_DAYS=$v ;;
-            2) read -p "输入周期目标(GB): " v; [ -n "$v" ] && PERIOD_TARGET_GB=$v ;;
-            3) read -p "输入每日目标(MB): " v; [ -n "$v" ] && DAILY_TARGET_MB=$v ;;
-            4) read -p "输入每日时长(分): " v; [ -n "$v" ] && DAILY_TIME_MIN=$v ;;
-            5) read -p "输入最大限速(MB/s): " v; [ -n "$v" ] && CRON_MAX_SPEED_MB=$v ;;
-            6) 
-               read -p "北京时间-小时 (0-23): " h; [ -n "$h" ] && BJ_CRON_HOUR=$h
-               read -p "北京时间-分钟 (0-59): " m; [ -n "$m" ] && BJ_CRON_MIN=$m 
-               ;;
-            7) read -p "开启上传 (0=关, 1=开): " v; [ -n "$v" ] && ENABLE_UPLOAD=$v ;;
-            t|T) measure_max_speed; read -p "按回车继续..." ;;
+            1) read -p "天数: " v; [ -n "$v" ] && PERIOD_DAYS=$v ;;
+            2) read -p "GB: " v; [ -n "$v" ] && PERIOD_TARGET_GB=$v ;;
+            3) read -p "日期(YYYY-MM-DD): " v; [ -n "$v" ] && PERIOD_START_DATE=$v ;;
+            4) read -p "MB: " v; [ -n "$v" ] && DAILY_TARGET_MB=$v ;;
+            5) read -p "分: " v; [ -n "$v" ] && DAILY_TIME_MIN=$v ;;
+            6) read -p "时: " h; [ -n "$h" ] && BJ_CRON_HOUR=$h; read -p "分: " m; [ -n "$m" ] && BJ_CRON_MIN=$m ;;
+            7) read -p "1=开, 0=关: " v; [ -n "$v" ] && ENABLE_HOURLY=$v ;;
+            8) read -p "间隔(分): " i; [ -n "$i" ] && HOURLY_INTERVAL_MIN=$i 
+               read -p "开始时: " s; [ -n "$s" ] && HOURLY_BJ_START=$s
+               read -p "结束时: " e; [ -n "$e" ] && HOURLY_BJ_END=$e ;;
+            9) read -p "流量(MB): " t; [ -n "$t" ] && HOURLY_TARGET_MB=$t 
+               read -p "耗时(分): " d; [ -n "$d" ] && HOURLY_DURATION_MIN=$d ;;
+            10) read -p "MB/s: " v; [ -n "$v" ] && CRON_MAX_SPEED_MB=$v ;;
+            s|S) save_config; install_cron; echo -e "${GREEN}保存并重载Cron!${PLAIN}"; sleep 1 ;;
             0) break ;;
-            *) ;;
         esac
     done
-    save_config
-    install_cron
-    echo -e "${GREEN}配置已保存并更新 Cron 任务!${PLAIN}"
-    sleep 1
 }
 
-show_dashboard() {
+dashboard() {
+    check_env
     clear
     load_config
     local bg_s="${RED}无${PLAIN}"
-    if [ -f "$BG_PID_FILE" ] && kill -0 $(cat "$BG_PID_FILE") 2>/dev/null; then
-        bg_s="${GREEN}运行中 (PID $(cat "$BG_PID_FILE"))${PLAIN}"
-    fi
+    [ -f "$BG_PID_FILE" ] && kill -0 $(cat "$BG_PID_FILE") 2>/dev/null && bg_s="${GREEN}运行中${PLAIN}"
+    local smart=$(calc_smart_target)
     
-    echo -e "${BLUE}==============================================${PLAIN}"
-    echo -e "    VPS Traffic Spirit v0.0.1 ${BOLD}(By Prince)${PLAIN}"
-    echo -e "${BLUE}==============================================${PLAIN}"
-    echo -e " [周期进度] $(kb_to_gb $PERIOD_KB) / $PERIOD_TARGET_GB GB (共 $PERIOD_DAYS 天)"
-    echo -e " [今日进度] $(kb_to_mb $TODAY_KB) / $DAILY_TARGET_MB MB"
-    echo -e " [Cron计划] 北京 ${YELLOW}$BJ_CRON_HOUR:$BJ_CRON_MIN${PLAIN} 启动 | 限速 $CRON_MAX_SPEED_MB MB/s"
-    echo -e " [后台任务] $bg_s"
+    echo -e "${BLUE}=== VPS Traffic Spirit v3.3.0 ===${PLAIN}"
+    echo -e " [周期] $(kb_to_gb $PERIOD_KB)/$PERIOD_TARGET_GB GB | 今日: $(kb_to_mb $TODAY_KB) MB"
+    echo -e " [智能] 周期保底今日目标: ${YELLOW}$smart MB${PLAIN}"
+    echo -e " [小时] $( [ $ENABLE_HOURLY -eq 1 ] && echo "${RED}ON${PLAIN} (每${HOURLY_INTERVAL_MIN}分, $HOURLY_TARGET_MB MB / $HOURLY_DURATION_MIN 分)" || echo "关闭" )"
+    echo -e " [后台] $bg_s"
     echo -e "----------------------------------------------"
-    echo -e " 1. 🚀 手动测速 / 定量运行"
-    echo -e " 2. ⚙️  完整参数设置 (含自动测速)"
-    echo -e " 3. 📄 查看运行日志"
-    echo -e " 4. 🗑️  卸载脚本"
+    echo -e " 1. 🚀 手动任务 (独立控速)"
+    echo -e " 2. ⚙️  配置菜单 (完整设置)"
+    echo -e " 3. 📄 运行日志"
+    echo -e " 4. 🗑️  安全卸载"
     echo -e " 0. 退出"
     echo -e "----------------------------------------------"
-    echo -n " 请选择: "
+    echo -n " 选择: "
 }
 
-# ======================
+# ==============================================================================
 # 8. 入口路由
-# ======================
+# ==============================================================================
 case "$1" in
     --cron) entry_cron ;;
-    --daily-reset) entry_reset ;;
-    --bg-run) run_traffic_task "BG" "DATA" "$2" "$3" ;;
+    --hourly) entry_hourly ;;
+    --bg-run) run_traffic "BG" "DATA" "$2" "$3" ;;
     *)
         while true; do
-            show_dashboard
+            dashboard
             read opt
             case "$opt" in
                 1) 
-                    echo -e "\n${BOLD}--- 🚀 手动模式 ---${PLAIN}"
-                    echo "1. ⚡ 极限测速 (跑 10 秒看速度)"
-                    echo "2. ⏳ 限时运行 (跑 X 秒)"
-                    echo "3. 📦 定量运行-前台 (跑 X MB)"
-                    echo "4. ☁️  定量运行-后台 (跑 X MB, 可关SSH)"
-                    echo "5. 🛑 停止后台任务"
-                    echo "0. 返回"
-                    read -p "选择: " sc
-                    case "$sc" in
-                        1) measure_max_speed; read -p "..." ;;
+                    echo -e "\n1.测速 2.定量(前) 3.定量(后) 4.停后台"
+                    read -p "选: " s
+                    case "$s" in
+                        1) echo "测速中..."; s=$(curl -s -w "%{speed_download}" -o /dev/null --max-time 10 "https://nbg1-speed.hetzner.com/10GB.bin"); echo "极速: $(awk "BEGIN {printf \"%.2f\", $s/1048576}") MB/s"; read -p "..." ;;
                         2) 
-                           read -p "运行秒数: " t; [ -n "$t" ] || continue
-                           read -p "限速 (MB/s) [默认$CRON_MAX_SPEED_MB]: " s; s=${s:-$CRON_MAX_SPEED_MB}
-                           run_traffic_task "MANUAL" "TIME" "$t" "$s" ;;
+                           read -p "目标MB: " d
+                           read -p "限速MB/s (回车默认max): " sp
+                           [ -z "$sp" ] && sp=$CRON_MAX_SPEED_MB
+                           run_traffic "MANUAL" "DATA" "$d" "$sp" ;;
                         3) 
-                           read -p "目标流量 (MB): " d; [ -n "$d" ] || continue
-                           read -p "限速 (MB/s) [默认$CRON_MAX_SPEED_MB]: " s; s=${s:-$CRON_MAX_SPEED_MB}
-                           run_traffic_task "MANUAL" "DATA" "$d" "$s" ;;
-                        4) 
-                           read -p "目标流量 (MB): " d; [ -n "$d" ] || continue
-                           read -p "限速 (MB/s) [默认$CRON_MAX_SPEED_MB]: " s; s=${s:-$CRON_MAX_SPEED_MB}
-                           run_bg_wrapper "$d" "$s" ;;
-                        5) 
-                           [ -f "$BG_PID_FILE" ] && kill $(cat "$BG_PID_FILE") 2>/dev/null && rm -f "$BG_PID_FILE" && echo "已停止"
-                           ;;
-                    esac
-                    ;;
-                2) menu_settings ;;
-                3) tail -n 15 "$LOG_DIR/traffic.log"; read -p "按回车继续..." ;;
-                4) 
-                   crontab -l | grep -v "$CRON_MARK" | crontab -
-                   rm -rf "$BASE_DIR"
-                   echo "卸载完成"; exit 0 ;;
+                           read -p "目标MB: " d
+                           read -p "限速MB/s (回车默认max): " sp
+                           [ -z "$sp" ] && sp=$CRON_MAX_SPEED_MB
+                           nohup "$SCRIPT_PATH" --bg-run "$d" "$sp" >/dev/null 2>&1 & 
+                           echo $! > "$BG_PID_FILE"; read -p "已启动..." ;;
+                        4) [ -f "$BG_PID_FILE" ] && kill $(cat "$BG_PID_FILE") 2>/dev/null && rm -f "$BG_PID_FILE" ;;
+                    esac ;;
+                2) menu ;;
+                3) tail -n 10 "$LOG_DIR/system.log"; read -p "..." ;;
+                4) uninstall_all ;;
                 0) exit 0 ;;
             esac
         done
