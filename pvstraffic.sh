@@ -4,6 +4,12 @@
 # Author: Prince 2025.12
 # ==============================================================================
 
+#!/bin/bash
+# ==============================================================================
+# VPS Traffic Spirit v2.9.0 (Beijing Time Unified)
+# Features: UTC+8 Seconds/Logs/Logic, Dynamic Day-Cutoff
+# ==============================================================================
+
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -30,27 +36,24 @@ BOLD='\033[1m'
 
 mkdir -p "$LOG_DIR"
 
-# ========== [默认配置] ==========
-# [A] 保底模式 (7天9G策略)
+# ========== [默认配置 (单位:MB, 时间:北京时间)] ==========
 PERIOD_DAYS=7
 PERIOD_TARGET_GB=9
-PERIOD_START_DATE="$(date +%F)"
-DAILY_TARGET_MB=1250
-DAILY_TIME_MIN=95
+PERIOD_START_DATE="" 
+DAILY_TARGET_MB=1225
+DAILY_TIME_MIN=90
 CRON_MAX_SPEED_MB=8
-BJ_CRON_HOUR=3
-BJ_CRON_MIN=05
+BJ_CRON_HOUR=3       # 日切点：北京时间 03:00
+BJ_CRON_MIN=10
 
-# [B] 模拟模式 (真实行为模拟)
 RANDOM_MODE_ENABLE=0
-R_DAILY_DL_MB=1155
+R_DAILY_DL_MB=1305
 R_DAILY_UP_MB=0
-R_DL_SPEED_MB=8
+R_DL_SPEED_MB=2
 R_UP_SPEED_MB=2
-R_UTC8_START=7
-R_UTC8_END=18
+R_BJ_START=7         # 模拟开始 (北京时间)
+R_BJ_END=12          # 模拟结束 (北京时间)
 
-# [C] 高级/小时任务
 ENABLE_HOURLY=0
 HOURLY_INTERVAL_MIN=60
 HOURLY_TARGET_MB=150
@@ -58,25 +61,45 @@ HOURLY_DURATION_MIN=5
 HOURLY_BJ_START=9
 HOURLY_BJ_END=19
 
-# [D] 系统参数
 ENABLE_UPLOAD=1
-UPLOAD_RATIO=3            # 上传比例 3%
-MEM_PROTECT_KB=65536      # 64MB 内存保护
-JITTER_PERCENT=20         # 20% 随机浮动
+UPLOAD_RATIO=3
+MEM_PROTECT_KB=65536
+JITTER_PERCENT=20
 
-# ========== [核心函数] ==========
+# ========== [时空基准函数] ==========
 
 reseed_random() {
     local seed
     if [ -r /dev/urandom ]; then
         seed=$(od -An -N4 -t u4 /dev/urandom | tr -d ' ')
     else
-        seed=$(date +%s%N)
+        seed=$($DATE_CMD +%s%N)
     fi
     RANDOM=$seed
 }
 
-now_sec() { $DATE_CMD +%s; }
+# [Fix 1] 秒级时间戳强制对齐北京时间 (+8h)
+now_sec() {
+    $DATE_CMD -u -d "+8 hours" +%s
+}
+
+# 获取北京时间字符串
+get_bj_time_str() {
+    $DATE_CMD -u -d "+8 hours" "+%F %T"
+}
+
+# 获取北京时间小时数 (0-23)
+get_bj_hour() {
+    $DATE_CMD -u -d "+8 hours" +%H | sed 's/^0//'
+}
+
+# [核心逻辑] 获取“逻辑日期” (北京时间 - Cron启动小时)
+# 作用：保持统计周期与Cron执行时间一致，防止日切点数据漂移
+get_logic_date() {
+    local offset_hour=${BJ_CRON_HOUR:-3}
+    $DATE_CMD -u -d "+8 hours -${offset_hour} hours" +%F
+}
+
 mb_to_kb() { awk "BEGIN{printf \"%.0f\", $1 * 1024}"; }
 kb_to_mb() { awk "BEGIN{printf \"%.2f\", $1 / 1024}"; }
 kb_to_gb() { awk "BEGIN{printf \"%.2f\", $1 / 1024 / 1024}"; }
@@ -89,7 +112,7 @@ apply_jitter() {
 }
 
 log() {
-    local ts="$($DATE_CMD '+%F %T')"
+    local ts=$(get_bj_time_str)
     echo -e "[$ts] $*" >> "$LOG_DIR/system.log"
     if [ "$IS_SILENT" != "1" ]; then echo -e "[$ts] $*"; fi
 }
@@ -127,6 +150,12 @@ check_env() {
 load_config() {
     [ -f "$CONF_FILE" ] && source "$CONF_FILE"
     [ -f "$STATS_FILE" ] && source "$STATS_FILE"
+    
+    # 兼容旧变量名迁移
+    if [ -n "$R_UTC8_START" ]; then R_BJ_START=$R_UTC8_START; unset R_UTC8_START; fi
+    if [ -n "$R_UTC8_END" ]; then R_BJ_END=$R_UTC8_END; unset R_UTC8_END; fi
+
+    [ -z "$PERIOD_START_DATE" ] && PERIOD_START_DATE=$(get_logic_date)
     TODAY_KB=${TODAY_KB:-0}
     PERIOD_KB=${PERIOD_KB:-0}
     TODAY_RUN_SEC=${TODAY_RUN_SEC:-0}
@@ -160,26 +189,27 @@ R_DAILY_DL_MB=$R_DAILY_DL_MB
 R_DAILY_UP_MB=$R_DAILY_UP_MB
 R_DL_SPEED_MB=$R_DL_SPEED_MB
 R_UP_SPEED_MB=$R_UP_SPEED_MB
-R_UTC8_START=$R_UTC8_START
-R_UTC8_END=$R_UTC8_END
+R_BJ_START=$R_BJ_START
+R_BJ_END=$R_BJ_END
 EOF
 }
 
 refresh_day_check() {
-    local today_str=$($DATE_CMD +%F)
+    # 依据逻辑日期（北京时间-Offset）判断跨天
+    local logic_today=$(get_logic_date)
     
-    if [ "$R_LAST_DAY" != "$today_str" ]; then
+    if [ "$R_LAST_DAY" != "$logic_today" ]; then
         R_TODAY_DL=0
         R_TODAY_UP=0
         TODAY_KB=0
         TODAY_RUN_SEC=0
-        R_LAST_DAY="$today_str"
+        R_LAST_DAY="$logic_today"
         
         cat >"$STATS_FILE"<<EOF
 TODAY_KB=$TODAY_KB
 TODAY_RUN_SEC=$TODAY_RUN_SEC
 PERIOD_KB=$PERIOD_KB
-LAST_RUN_TIME="$($DATE_CMD '+%F %T')"
+LAST_RUN_TIME="$(get_bj_time_str)"
 LAST_RUN_KB=0
 R_TODAY_DL=$R_TODAY_DL
 R_TODAY_UP=$R_TODAY_UP
@@ -214,7 +244,7 @@ update_stats() {
 TODAY_KB=$TODAY_KB
 TODAY_RUN_SEC=$TODAY_RUN_SEC
 PERIOD_KB=$PERIOD_KB
-LAST_RUN_TIME="$($DATE_CMD '+%F %T')"
+LAST_RUN_TIME="$(get_bj_time_str)"
 LAST_RUN_KB=$add_kb
 R_TODAY_DL=$R_TODAY_DL
 R_TODAY_UP=$R_TODAY_UP
@@ -225,8 +255,8 @@ EOF
 
 calc_smart_target() {
     local start_s=$($DATE_CMD -d "$PERIOD_START_DATE" +%s)
-    local cur_s=$(now_sec)
-    local passed_days=$(( ( cur_s - start_s ) / 86400 ))
+    local cur_logic_s=$($DATE_CMD -d "$(get_logic_date)" +%s)
+    local passed_days=$(( ( cur_logic_s - start_s ) / 86400 ))
     [ "$passed_days" -lt 0 ] && passed_days=0
     
     local left_days=$(( PERIOD_DAYS - passed_days ))
@@ -244,12 +274,9 @@ calc_smart_target() {
     echo $(apply_jitter "$final_target_mb")
 }
 
-check_random_window_utc8() {
-    local utc_h=$($DATE_CMD -u +%H | sed 's/^0//')
-    local target_h=$(( utc_h - 8 )) 
-    if [ "$target_h" -lt 0 ]; then target_h=$(( target_h + 24 )); fi
-    
-    if [ "$target_h" -ge "$R_UTC8_START" ] && [ "$target_h" -le "$R_UTC8_END" ]; then return 0; fi
+check_random_window_bj() {
+    local bj_h=$(get_bj_hour)
+    if [ "$bj_h" -ge "$R_BJ_START" ] && [ "$bj_h" -le "$R_BJ_END" ]; then return 0; fi
     return 1
 }
 
@@ -432,10 +459,15 @@ run_traffic() {
 
 install_cron() {
     check_env
-    local offset=$($DATE_CMD +%z | sed 's/^+//' | cut -c1-3)
-    local svr_h=$(( BJ_CRON_HOUR - 8 + offset ))
+    # 自动换算：VPS本地Cron时间 = 北京目标时间 + (VPS本地小时 - 北京小时)
+    local bj_now_h=$($DATE_CMD -u -d "+8 hours" +%H | sed 's/^0//')
+    local local_now_h=$($DATE_CMD +%H | sed 's/^0//')
+    local diff=$(( local_now_h - bj_now_h ))
+    
+    local svr_h=$(( BJ_CRON_HOUR + diff ))
     while [ "$svr_h" -lt 0 ]; do svr_h=$(( svr_h + 24 )); done
     while [ "$svr_h" -ge 24 ]; do svr_h=$(( svr_h - 24 )); done
+    
     local tmp="$SCRIPT_DIR/cron.tmp"
     crontab -l 2>/dev/null | grep -F -v "$CRON_MARK" > "$tmp"
     
@@ -449,7 +481,8 @@ install_cron() {
     fi
     
     crontab "$tmp" && rm -f "$tmp"
-    echo -e "${GREEN}Cron 计划任务已更新!${PLAIN} 保底任务时间: 本地 $svr_h:$BJ_CRON_MIN"
+    echo -e "${GREEN}Cron 计划任务已更新!${PLAIN}"
+    echo -e "保底任务: 北京时间 ${GREEN}$BJ_CRON_HOUR:$BJ_CRON_MIN${PLAIN} (VPS本地时间 $svr_h:$BJ_CRON_MIN)"
 }
 
 uninstall_all() {
@@ -475,13 +508,13 @@ entry_cron() {
     refresh_day_check
     
     local start_s=$($DATE_CMD -d "$PERIOD_START_DATE" +%s)
-    local cur_s=$(now_sec)
-    local passed_days=$(( ( cur_s - start_s ) / 86400 ))
+    local cur_logic_s=$($DATE_CMD -d "$(get_logic_date)" +%s)
+    local passed_days=$(( ( cur_logic_s - start_s ) / 86400 ))
     local total_kb=$(gb_to_kb "$PERIOD_TARGET_GB")
     
     if [ "$passed_days" -ge "$PERIOD_DAYS" ] && [ "$PERIOD_KB" -ge "$total_kb" ]; then
         log "[Cycle] 周期结束且达标，重置为新周期。"
-        PERIOD_START_DATE=$($DATE_CMD +%F)
+        PERIOD_START_DATE=$(get_logic_date)
         PERIOD_KB=0
         save_config
         load_config
@@ -512,7 +545,7 @@ entry_hourly() {
     load_config
     refresh_day_check
     if [ "$ENABLE_HOURLY" != "1" ]; then exit 0; fi
-    local bj_h=$($DATE_CMD -u -d "+8 hours" +%H | sed 's/^0//')
+    local bj_h=$(get_bj_hour)
     if [ "$bj_h" -ge "$HOURLY_BJ_START" ] && [ "$bj_h" -le "$HOURLY_BJ_END" ]; then
         run_traffic "HOURLY" "DATA" "$HOURLY_TARGET_MB" "0" "MIX"
     fi
@@ -527,7 +560,7 @@ entry_random() {
     refresh_day_check
     
     if [ "$RANDOM_MODE_ENABLE" != "1" ]; then exit 0; fi
-    if ! check_random_window_utc8; then exit 0; fi
+    if ! check_random_window_bj; then exit 0; fi
     
     if [ $(( RANDOM % 100 )) -lt 30 ]; then exit 0; fi
     log "[Random] 触发模拟任务"
@@ -571,16 +604,16 @@ menu() {
     while true; do
         clear
         load_config
-        echo -e "${BLUE}=== VPS Traffic Spirit v2.6.0 ===${PLAIN}"
+        echo -e "${BLUE}=== VPS Traffic Spirit v2.9.0 (Beijing Time) ===${PLAIN}"
         echo -e "${BOLD}[A] 周期保底模式${PLAIN}"
         echo -e " 1. 周期设定 : ${GREEN}$PERIOD_DAYS${PLAIN} 天 / ${GREEN}$PERIOD_TARGET_GB${PLAIN} GB"
-        echo -e " 2. 开始日期 : $PERIOD_START_DATE"
-        echo -e " 3. 启动时间 : 北京时间 ${GREEN}$BJ_CRON_HOUR:$BJ_CRON_MIN${PLAIN}"
+        echo -e " 2. 开始日期 : $PERIOD_START_DATE (逻辑日期)"
+        echo -e " 3. 启动时间 : 北京时间 ${GREEN}$BJ_CRON_HOUR:$BJ_CRON_MIN${PLAIN} (兼日切点)"
         echo -e "${BOLD}[B] 独立模拟模式${PLAIN}"
         echo -e " 4. 模式开关 : $( [ $RANDOM_MODE_ENABLE -eq 1 ] && echo "${RED}开启${PLAIN}" || echo "关闭" )"
         echo -e " 5. 每日上限 : 下载 ${GREEN}$R_DAILY_DL_MB${PLAIN} / 上传 ${GREEN}$R_DAILY_UP_MB${PLAIN} MB"
         echo -e " 6. 速率限制 : 下载 ${GREEN}$R_DL_SPEED_MB${PLAIN} / 上传 ${GREEN}$R_UP_SPEED_MB${PLAIN} MB/s"
-        echo -e " 7. 运行时间 : UTC-8 ${GREEN}$R_UTC8_START点${PLAIN} 到 ${GREEN}$R_UTC8_END点${PLAIN}"
+        echo -e " 7. 运行时间 : 北京时间 ${GREEN}$R_BJ_START点${PLAIN} 到 ${GREEN}$R_BJ_END点${PLAIN}"
         echo -e "${BOLD}[C] 系统参数设置${PLAIN}"
         echo -e " 8. 高级设置 : 浮动${GREEN}$JITTER_PERCENT${PLAIN}% | 内存保护${GREEN}$((MEM_PROTECT_KB/1024))${PLAIN}MB"
         echo -e "----------------------------------------------"
@@ -593,7 +626,7 @@ menu() {
             4) read -p "1=开启, 0=关闭: " v; [ -n "$v" ] && RANDOM_MODE_ENABLE=$v ;;
             5) read -p "下载上限(MB): " d; [ -n "$d" ] && R_DAILY_DL_MB=$d; read -p "上传上限(MB): " u; [ -n "$u" ] && R_DAILY_UP_MB=$u ;;
             6) read -p "下载速率(MB/s): " d; [ -n "$d" ] && R_DL_SPEED_MB=$d; read -p "上传速率(MB/s): " u; [ -n "$u" ] && R_UP_SPEED_MB=$u ;;
-            7) read -p "开始时间点: " s; [ -n "$s" ] && R_UTC8_START=$s; read -p "结束时间点: " e; [ -n "$e" ] && R_UTC8_END=$e ;;
+            7) read -p "开始时间点: " s; [ -n "$s" ] && R_BJ_START=$s; read -p "结束时间点: " e; [ -n "$e" ] && R_BJ_END=$e ;;
             8) read -p "浮动百分比 (0-20): " j; [ -n "$j" ] && JITTER_PERCENT=$j ;;
             s|S) save_config; install_cron; echo -e "${GREEN}配置已保存并生效!${PLAIN}"; sleep 1 ;;
             0) break ;;
@@ -609,14 +642,14 @@ dashboard() {
     local bg_s="${RED}无${PLAIN}"
     [ -f "$BG_PID_FILE" ] && kill -0 $(cat "$BG_PID_FILE") 2>/dev/null && bg_s="${GREEN}运行中${PLAIN}"
     local smart=$(calc_smart_target)
-    echo -e "${BLUE}=== VPS Traffic Spirit v2.6.0 ===${PLAIN}"
+    echo -e "${BLUE}=== VPS Traffic Spirit v2.9.0 ===${PLAIN}"
     echo -e " [保底模式] $(kb_to_gb $PERIOD_KB)/$PERIOD_TARGET_GB GB | 今日补全目标: ${YELLOW}$smart MB${PLAIN}"
     echo -e " [模拟模式] $( [ $RANDOM_MODE_ENABLE -eq 1 ] && echo "${RED}开启${PLAIN}" || echo "关闭" ) | 今日: DL $(kb_to_mb $R_TODAY_DL) / UP $(kb_to_mb $R_TODAY_UP) MB"
-    echo -e " [系统状态] 后台: $bg_s | 时间检测: ${GREEN}$DATE_CMD${PLAIN}"
+    echo -e " [系统状态] 后台: $bg_s | 北京时间: ${GREEN}$(get_bj_time_str)${PLAIN}"
     echo -e "----------------------------------------------"
     echo -e " 1. 手动运行 / 测速"
     echo -e " 2. 配置菜单"
-    echo -e " 3. 查看日志"
+    echo -e " 3. 查看日志 (北京时间)"
     echo -e " 4. 卸载脚本"
     echo -e " 0. 退出"
     echo -n " 请选择: "
