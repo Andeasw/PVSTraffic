@@ -30,33 +30,41 @@ BOLD='\033[1m'
 
 mkdir -p "$LOG_DIR"
 
+# ========== [默认配置] ==========
+# [A] 保底模式 (7天9G策略)
 PERIOD_DAYS=7
 PERIOD_TARGET_GB=9
 PERIOD_START_DATE="$(date +%F)"
-DAILY_TARGET_MB=1300
-DAILY_TIME_MIN=120
-CRON_MAX_SPEED_MB=10
+DAILY_TARGET_MB=1250
+DAILY_TIME_MIN=95
+CRON_MAX_SPEED_MB=8
 BJ_CRON_HOUR=3
-BJ_CRON_MIN=10
+BJ_CRON_MIN=05
 
+# [B] 模拟模式 (真实行为模拟)
 RANDOM_MODE_ENABLE=0
-R_DAILY_DL_MB=500
-R_DAILY_UP_MB=300
-R_DL_SPEED_MB=5
+R_DAILY_DL_MB=1155
+R_DAILY_UP_MB=0
+R_DL_SPEED_MB=8
 R_UP_SPEED_MB=2
-R_UTC8_START=8
-R_UTC8_END=22
+R_UTC8_START=7
+R_UTC8_END=18
 
+# [C] 高级/小时任务
 ENABLE_HOURLY=0
 HOURLY_INTERVAL_MIN=60
 HOURLY_TARGET_MB=150
 HOURLY_DURATION_MIN=5
 HOURLY_BJ_START=9
 HOURLY_BJ_END=19
+
+# [D] 系统参数
 ENABLE_UPLOAD=1
-UPLOAD_RATIO=3
-MEM_PROTECT_KB=65536
-JITTER_PERCENT=20
+UPLOAD_RATIO=3            # 上传比例 3%
+MEM_PROTECT_KB=65536      # 64MB 内存保护
+JITTER_PERCENT=20         # 20% 随机浮动
+
+# ========== [核心函数] ==========
 
 reseed_random() {
     local seed
@@ -277,13 +285,13 @@ run_traffic() {
     if [[ "$mode" == "CRON" || "$mode" == "HOURLY" || "$mode" == "BG" || "$mode" == "RANDOM" ]]; then IS_SILENT=1; fi
 
     local disk_kb=$(df -P "$SCRIPT_DIR" | awk 'NR==2 {print $4}')
-    [ "${disk_kb:-0}" -lt 51200 ] && log "${YELLOW}[Warn] Low Disk Space${PLAIN}"
+    [ "${disk_kb:-0}" -lt 51200 ] && log "${YELLOW}[警告] 磁盘空间不足${PLAIN}"
     
     if [ "$direction" == "UPLOAD_ONLY" ] || [ "$ENABLE_UPLOAD" == "1" ]; then
         local mem_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
         [ -z "$mem_kb" ] && mem_kb=$(awk '/MemFree/ {print $2}' /proc/meminfo)
         if [ "${mem_kb:-0}" -lt "$MEM_PROTECT_KB" ]; then
-             [ "$direction" == "UPLOAD_ONLY" ] && log "${YELLOW}[Skip] Low Memory${PLAIN}" && return
+             [ "$direction" == "UPLOAD_ONLY" ] && log "${YELLOW}[跳过] 内存不足${PLAIN}" && return
              ENABLE_UPLOAD=0
         fi
     fi
@@ -322,8 +330,8 @@ run_traffic() {
         prepare_upload_data
     fi
     
-    local msg="Task[$mode] Dir:$direction"
-    log "$msg Limit:$(kb_to_mb $speed_kb)MB/s Target:$val"
+    local msg="任务[$mode] 方向:$direction"
+    log "$msg 限速:$(kb_to_mb $speed_kb)MB/s 目标:$val"
     
     local start_ts=$(now_sec)
     local current_kb=0
@@ -396,7 +404,7 @@ run_traffic() {
             [ "$pct" -gt 100 ] && pct=100
 
             if [ "$IS_SILENT" == "0" ]; then
-                echo -ne "\r[Running] Prog:${pct}% | Total:$(kb_to_mb $current_kb)MB | DL:~$(kb_to_mb $tick_dl)MB/s UL:~$(kb_to_mb $tick_up)MB/s "
+                echo -ne "\r[运行中] 进度:${pct}% | 总量:$(kb_to_mb $current_kb)MB | 下载:~$(kb_to_mb $tick_dl)MB/s 上传:~$(kb_to_mb $tick_up)MB/s "
             fi
             
             if [ "$done" -eq 1 ]; then
@@ -417,8 +425,8 @@ run_traffic() {
     local is_rnd=0
     [ "$mode" == "RANDOM" ] && is_rnd=1
     update_stats "$current_kb" "$dur" "$is_rnd" "$dl_acc" "$up_acc"
-    if [ "$IS_SILENT" == "0" ]; then echo -e "\n${GREEN}Completed.${PLAIN}"; fi
-    log "Done[$mode]: Traffic=$(kb_to_mb $current_kb)MB Time=${dur}s"
+    if [ "$IS_SILENT" == "0" ]; then echo -e "\n${GREEN}任务完成。${PLAIN}"; fi
+    log "完成[$mode]: 流量=$(kb_to_mb $current_kb)MB 耗时=${dur}s"
     rm -f "$BG_PID_FILE"
 }
 
@@ -441,11 +449,11 @@ install_cron() {
     fi
     
     crontab "$tmp" && rm -f "$tmp"
-    echo -e "${GREEN}Cron Updated!${PLAIN} Guarantee Run: Local $svr_h:$BJ_CRON_MIN"
+    echo -e "${GREEN}Cron 计划任务已更新!${PLAIN} 保底任务时间: 本地 $svr_h:$BJ_CRON_MIN"
 }
 
 uninstall_all() {
-    echo -e "${YELLOW}Uninstalling...${PLAIN}"
+    echo -e "${YELLOW}正在卸载...${PLAIN}"
     crontab -l 2>/dev/null | grep -F -v "$CRON_MARK" > "$SCRIPT_DIR/cron.clean"
     crontab "$SCRIPT_DIR/cron.clean"
     rm -f "$SCRIPT_DIR/cron.clean"
@@ -453,7 +461,7 @@ uninstall_all() {
     pkill -f "$SCRIPT_NAME" 2>/dev/null
     rm -f "$CONF_FILE" "$STATS_FILE" "$LOCK_DAILY" "$LOCK_HOURLY" "$LOCK_RANDOM" "$STATS_LOCK" "$BG_PID_FILE" "$TEMP_DATA_FILE"
     rm -rf "$LOG_DIR"
-    echo -e "${GREEN}Done.${PLAIN}"
+    echo -e "${GREEN}卸载完成。${PLAIN}"
     exit 0
 }
 
@@ -463,7 +471,7 @@ entry_cron() {
     sleep $(( RANDOM % 120 ))
     exec 9>"$LOCK_DAILY"; flock -n 9 || exit 0
     load_config
-    log "[Cron] Guarantee Triggered"
+    log "[Cron] 触发保底任务检查"
     refresh_day_check
     
     local start_s=$($DATE_CMD -d "$PERIOD_START_DATE" +%s)
@@ -472,7 +480,7 @@ entry_cron() {
     local total_kb=$(gb_to_kb "$PERIOD_TARGET_GB")
     
     if [ "$passed_days" -ge "$PERIOD_DAYS" ] && [ "$PERIOD_KB" -ge "$total_kb" ]; then
-        log "[Cycle] Cycle finished. Resetting to today."
+        log "[Cycle] 周期结束且达标，重置为新周期。"
         PERIOD_START_DATE=$($DATE_CMD +%F)
         PERIOD_KB=0
         save_config
@@ -483,7 +491,7 @@ entry_cron() {
     local target_kb=$(mb_to_kb "$target_mb")
     local current_kb=${TODAY_KB:-0}
 
-    log "[Cron] Check: Done=$(kb_to_mb $current_kb) MB, Target=$target_mb MB"
+    log "[Cron] 状态: 今日已跑=$(kb_to_mb $current_kb) MB, 目标=$target_mb MB"
     
     if [ $(awk "BEGIN{print ($current_kb < $target_kb)?1:0}") -eq 1 ]; then
         local todo_kb=$(( target_kb - current_kb ))
@@ -492,7 +500,7 @@ entry_cron() {
         
         run_traffic "CRON" "DATA" "$todo_mb" "0" "MIX"
     else
-        log "[Cron] Target met, skipping."
+        log "[Cron] 今日流量已达标，跳过。"
     fi
 }
 
@@ -522,7 +530,7 @@ entry_random() {
     if ! check_random_window_utc8; then exit 0; fi
     
     if [ $(( RANDOM % 100 )) -lt 30 ]; then exit 0; fi
-    log "[Random] Triggered"
+    log "[Random] 触发模拟任务"
     
     local cur_dl=$(kb_to_mb $R_TODAY_DL)
     local cur_up=$(kb_to_mb $R_TODAY_UP)
@@ -563,31 +571,31 @@ menu() {
     while true; do
         clear
         load_config
-        echo -e "${BLUE}=== VPS Traffic Spirit v1.0.0 ===${PLAIN}"
-        echo -e "${BOLD}[A] Guarantee Mode${PLAIN}"
-        echo -e " 1. Cycle: ${GREEN}$PERIOD_DAYS${PLAIN} Days / ${GREEN}$PERIOD_TARGET_GB${PLAIN} GB"
-        echo -e " 2. Start: $PERIOD_START_DATE"
-        echo -e " 3. Start Time: BJ ${GREEN}$BJ_CRON_HOUR:$BJ_CRON_MIN${PLAIN}"
-        echo -e "${BOLD}[B] Simulation Mode${PLAIN}"
-        echo -e " 4. Status: $( [ $RANDOM_MODE_ENABLE -eq 1 ] && echo "${RED}ON${PLAIN}" || echo "OFF" )"
-        echo -e " 5. Limits: DL ${GREEN}$R_DAILY_DL_MB${PLAIN} / UL ${GREEN}$R_DAILY_UP_MB${PLAIN} MB"
-        echo -e " 6. Speed: DL ${GREEN}$R_DL_SPEED_MB${PLAIN} / UL ${GREEN}$R_UP_SPEED_MB${PLAIN} MB/s"
-        echo -e " 7. Time: UTC-8 ${GREEN}$R_UTC8_START - $R_UTC8_END${PLAIN}"
-        echo -e "${BOLD}[C] System${PLAIN}"
-        echo -e " 8. Settings: Jitter ${GREEN}$JITTER_PERCENT${PLAIN}% | MemGuard ${GREEN}$((MEM_PROTECT_KB/1024))${PLAIN}MB"
+        echo -e "${BLUE}=== VPS Traffic Spirit v2.6.0 ===${PLAIN}"
+        echo -e "${BOLD}[A] 周期保底模式${PLAIN}"
+        echo -e " 1. 周期设定 : ${GREEN}$PERIOD_DAYS${PLAIN} 天 / ${GREEN}$PERIOD_TARGET_GB${PLAIN} GB"
+        echo -e " 2. 开始日期 : $PERIOD_START_DATE"
+        echo -e " 3. 启动时间 : 北京时间 ${GREEN}$BJ_CRON_HOUR:$BJ_CRON_MIN${PLAIN}"
+        echo -e "${BOLD}[B] 独立模拟模式${PLAIN}"
+        echo -e " 4. 模式开关 : $( [ $RANDOM_MODE_ENABLE -eq 1 ] && echo "${RED}开启${PLAIN}" || echo "关闭" )"
+        echo -e " 5. 每日上限 : 下载 ${GREEN}$R_DAILY_DL_MB${PLAIN} / 上传 ${GREEN}$R_DAILY_UP_MB${PLAIN} MB"
+        echo -e " 6. 速率限制 : 下载 ${GREEN}$R_DL_SPEED_MB${PLAIN} / 上传 ${GREEN}$R_UP_SPEED_MB${PLAIN} MB/s"
+        echo -e " 7. 运行时间 : UTC-8 ${GREEN}$R_UTC8_START点${PLAIN} 到 ${GREEN}$R_UTC8_END点${PLAIN}"
+        echo -e "${BOLD}[C] 系统参数设置${PLAIN}"
+        echo -e " 8. 高级设置 : 浮动${GREEN}$JITTER_PERCENT${PLAIN}% | 内存保护${GREEN}$((MEM_PROTECT_KB/1024))${PLAIN}MB"
         echo -e "----------------------------------------------"
-        echo -e " S. Save | 0. Exit"
-        read -p "Opt: " c
+        echo -e " S. 保存配置 | 0. 退出"
+        read -p "请输入选项: " c
         case "$c" in
-            1) read -p "Days: " d; [ -n "$d" ] && PERIOD_DAYS=$d; read -p "GB: " g; [ -n "$g" ] && PERIOD_TARGET_GB=$g ;;
-            2) read -p "Date(YYYY-MM-DD): " v; [ -n "$v" ] && PERIOD_START_DATE=$v ;;
-            3) read -p "Hour: " h; [ -n "$h" ] && BJ_CRON_HOUR=$h; read -p "Min: " m; [ -n "$m" ] && BJ_CRON_MIN=$m ;;
-            4) read -p "1=On, 0=Off: " v; [ -n "$v" ] && RANDOM_MODE_ENABLE=$v ;;
-            5) read -p "DL Max(MB): " d; [ -n "$d" ] && R_DAILY_DL_MB=$d; read -p "UL Max(MB): " u; [ -n "$u" ] && R_DAILY_UP_MB=$u ;;
-            6) read -p "DL Speed: " d; [ -n "$d" ] && R_DL_SPEED_MB=$d; read -p "UL Speed: " u; [ -n "$u" ] && R_UP_SPEED_MB=$u ;;
-            7) read -p "Start Hr: " s; [ -n "$s" ] && R_UTC8_START=$s; read -p "End Hr: " e; [ -n "$e" ] && R_UTC8_END=$e ;;
-            8) read -p "Jitter %: " j; [ -n "$j" ] && JITTER_PERCENT=$j ;;
-            s|S) save_config; install_cron; echo -e "${GREEN}Saved!${PLAIN}"; sleep 1 ;;
+            1) read -p "周期天数 (默认7): " d; [ -n "$d" ] && PERIOD_DAYS=$d; read -p "目标流量GB (默认9): " g; [ -n "$g" ] && PERIOD_TARGET_GB=$g ;;
+            2) read -p "开始日期 (YYYY-MM-DD): " v; [ -n "$v" ] && PERIOD_START_DATE=$v ;;
+            3) read -p "小时 (0-23): " h; [ -n "$h" ] && BJ_CRON_HOUR=$h; read -p "分钟 (0-59): " m; [ -n "$m" ] && BJ_CRON_MIN=$m ;;
+            4) read -p "1=开启, 0=关闭: " v; [ -n "$v" ] && RANDOM_MODE_ENABLE=$v ;;
+            5) read -p "下载上限(MB): " d; [ -n "$d" ] && R_DAILY_DL_MB=$d; read -p "上传上限(MB): " u; [ -n "$u" ] && R_DAILY_UP_MB=$u ;;
+            6) read -p "下载速率(MB/s): " d; [ -n "$d" ] && R_DL_SPEED_MB=$d; read -p "上传速率(MB/s): " u; [ -n "$u" ] && R_UP_SPEED_MB=$u ;;
+            7) read -p "开始时间点: " s; [ -n "$s" ] && R_UTC8_START=$s; read -p "结束时间点: " e; [ -n "$e" ] && R_UTC8_END=$e ;;
+            8) read -p "浮动百分比 (0-20): " j; [ -n "$j" ] && JITTER_PERCENT=$j ;;
+            s|S) save_config; install_cron; echo -e "${GREEN}配置已保存并生效!${PLAIN}"; sleep 1 ;;
             0) break ;;
         esac
     done
@@ -598,20 +606,20 @@ dashboard() {
     check_env
     clear
     load_config
-    local bg_s="${RED}No${PLAIN}"
-    [ -f "$BG_PID_FILE" ] && kill -0 $(cat "$BG_PID_FILE") 2>/dev/null && bg_s="${GREEN}Yes${PLAIN}"
+    local bg_s="${RED}无${PLAIN}"
+    [ -f "$BG_PID_FILE" ] && kill -0 $(cat "$BG_PID_FILE") 2>/dev/null && bg_s="${GREEN}运行中${PLAIN}"
     local smart=$(calc_smart_target)
-    echo -e "${BLUE}=== VPS Traffic Spirit v2.5.0 ===${PLAIN}"
-    echo -e " [Guarantee] $(kb_to_gb $PERIOD_KB)/$PERIOD_TARGET_GB GB | Today Target: ${YELLOW}$smart MB${PLAIN}"
-    echo -e " [Simulate] $( [ $RANDOM_MODE_ENABLE -eq 1 ] && echo "${RED}ON${PLAIN}" || echo "OFF" ) | Today: DL $(kb_to_mb $R_TODAY_DL) / UP $(kb_to_mb $R_TODAY_UP) MB"
-    echo -e " [Status] BG: $bg_s | DateCmd: ${GREEN}$DATE_CMD${PLAIN}"
+    echo -e "${BLUE}=== VPS Traffic Spirit v2.6.0 ===${PLAIN}"
+    echo -e " [保底模式] $(kb_to_gb $PERIOD_KB)/$PERIOD_TARGET_GB GB | 今日补全目标: ${YELLOW}$smart MB${PLAIN}"
+    echo -e " [模拟模式] $( [ $RANDOM_MODE_ENABLE -eq 1 ] && echo "${RED}开启${PLAIN}" || echo "关闭" ) | 今日: DL $(kb_to_mb $R_TODAY_DL) / UP $(kb_to_mb $R_TODAY_UP) MB"
+    echo -e " [系统状态] 后台: $bg_s | 时间检测: ${GREEN}$DATE_CMD${PLAIN}"
     echo -e "----------------------------------------------"
-    echo -e " 1. Manual / Speedtest"
-    echo -e " 2. Menu"
-    echo -e " 3. Logs"
-    echo -e " 4. Uninstall"
-    echo -e " 0. Exit"
-    echo -n " Select: "
+    echo -e " 1. 手动运行 / 测速"
+    echo -e " 2. 配置菜单"
+    echo -e " 3. 查看日志"
+    echo -e " 4. 卸载脚本"
+    echo -e " 0. 退出"
+    echo -n " 请选择: "
 }
 
 case "$1" in
@@ -625,16 +633,16 @@ case "$1" in
             read opt
             case "$opt" in
                 1) 
-                    echo -e "\n1.Test 2.FgRun 3.BgRun 4.UploadOnly"
-                    read -p "Opt: " s
+                    echo -e "\n1.下载测速 2.前台跑量 3.后台跑量 4.纯上传模式"
+                    read -p "选项: " s
                     case "$s" in
-                        1) echo "Testing..."; s=$(curl -s -w "%{speed_download}" -o /dev/null --max-time 10 "https://nbg1-speed.hetzner.com/10GB.bin"); echo "Speed: $(awk "BEGIN {printf \"%.2f\", $s/1048576}") MB/s"; read -p "..." ;;
-                        2) read -p "MB: " d; read -p "MB/s: " sp; run_traffic "MANUAL" "DATA" "$d" "$sp" "MIX" ;;
-                        3) read -p "MB: " d; read -p "MB/s: " sp; nohup "$SCRIPT_PATH" --bg-run "$d" "$sp" >/dev/null 2>&1 & echo $! > "$BG_PID_FILE"; read -p "Started..." ;;
-                        4) read -p "MB: " d; read -p "MB/s: " sp; run_traffic "MANUAL" "DATA" "$d" "$sp" "UPLOAD_ONLY" ;;
+                        1) echo "正在测速..."; s=$(curl -s -w "%{speed_download}" -o /dev/null --max-time 10 "https://nbg1-speed.hetzner.com/10GB.bin"); echo "速度: $(awk "BEGIN {printf \"%.2f\", $s/1048576}") MB/s"; read -p "按回车继续..." ;;
+                        2) read -p "目标流量(MB): " d; read -p "限制速率(MB/s): " sp; run_traffic "MANUAL" "DATA" "$d" "$sp" "MIX" ;;
+                        3) read -p "目标流量(MB): " d; read -p "限制速率(MB/s): " sp; nohup "$SCRIPT_PATH" --bg-run "$d" "$sp" >/dev/null 2>&1 & echo $! > "$BG_PID_FILE"; read -p "已转入后台运行..." ;;
+                        4) read -p "目标流量(MB): " d; read -p "限制速率(MB/s): " sp; run_traffic "MANUAL" "DATA" "$d" "$sp" "UPLOAD_ONLY" ;;
                     esac ;;
                 2) menu ;;
-                3) tail -n 10 "$LOG_DIR/system.log"; read -p "..." ;;
+                3) tail -n 10 "$LOG_DIR/system.log"; read -p "按回车继续..." ;;
                 4) uninstall_all ;;
                 0) exit 0 ;;
             esac
