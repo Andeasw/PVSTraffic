@@ -10,8 +10,7 @@
 ---
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Andeasw/PVSTraffic/master/pvstraffic.sh | bash
-
+curl -fsSL https://raw.githubusercontent.com/Andeasw/PVSTraffic/master/pvstraffic.sh -o pvstraffic.sh && chmod +x pvstraffic.sh && sudo ./pvstraffic.sh
 ```
 
 ## 🌟 Key Features
