@@ -4,7 +4,6 @@
 # Author: Prince 2025.12
 # ==============================================================================
 
-#!/bin/bash
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 SCRIPT_NAME=$(basename "$0")
 SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_NAME"
@@ -17,6 +16,7 @@ STATS_LOCK="$SCRIPT_DIR/stats.lock"
 BG_PID_FILE="$SCRIPT_DIR/bg.pid"
 TEMP_DATA_FILE="/tmp/traffic_spirit_chunk.dat"
 CRON_MARK="# [VPS_TRAFFIC_SPIRIT_V3]"
+
 RED='\033[31m'
 GREEN='\033[32m'
 YELLOW='\033[33m'
@@ -45,6 +45,18 @@ UPLOAD_RATIO=3
 MEM_PROTECT_KB=32768
 NODE_STRATEGY=3
 JITTER_PERCENT=15
+
+# Random Mode Settings
+RANDOM_MODE_ENABLE=0
+RANDOM_DAILY_TARGET_MB=500
+RANDOM_DAILY_UPLOAD_TARGET_MB=200
+RANDOM_DAILY_SPEED_MB=5
+RANDOM_DAILY_UPLOAD_SPEED_MB=3
+RANDOM_UTC_OFFSET=8 # For UTC-8
+RANDOM_RUN_HOUR_START=8
+RANDOM_RUN_HOUR_END=22
+RANDOM_DURATION_MIN=30
+RANDOM_INTERVAL_MIN=60
 
 now_sec() { date +%s; }
 mb_to_kb() { awk "BEGIN{printf \"%.0f\", $1 * 1024}"; }
@@ -83,6 +95,17 @@ load_config() {
     HOURLY_DURATION_MIN=${HOURLY_DURATION_MIN:-2}
     UPLOAD_RATIO=${UPLOAD_RATIO:-3}
     MEM_PROTECT_KB=${MEM_PROTECT_KB:-32768}
+
+    RANDOM_MODE_ENABLE=${RANDOM_MODE_ENABLE:-0}
+    RANDOM_DAILY_TARGET_MB=${RANDOM_DAILY_TARGET_MB:-500}
+    RANDOM_DAILY_UPLOAD_TARGET_MB=${RANDOM_DAILY_UPLOAD_TARGET_MB:-200}
+    RANDOM_DAILY_SPEED_MB=${RANDOM_DAILY_SPEED_MB:-5}
+    RANDOM_DAILY_UPLOAD_SPEED_MB=${RANDOM_DAILY_UPLOAD_SPEED_MB:-3}
+    RANDOM_UTC_OFFSET=${RANDOM_UTC_OFFSET:-8}
+    RANDOM_RUN_HOUR_START=${RANDOM_RUN_HOUR_START:-8}
+    RANDOM_RUN_HOUR_END=${RANDOM_RUN_HOUR_END:-22}
+    RANDOM_DURATION_MIN=${RANDOM_DURATION_MIN:-30}
+    RANDOM_INTERVAL_MIN=${RANDOM_INTERVAL_MIN:-60}
 }
 
 save_config() {
@@ -106,6 +129,17 @@ UPLOAD_RATIO=$UPLOAD_RATIO
 NODE_STRATEGY=$NODE_STRATEGY
 JITTER_PERCENT=$JITTER_PERCENT
 MEM_PROTECT_KB=$MEM_PROTECT_KB
+
+RANDOM_MODE_ENABLE=$RANDOM_MODE_ENABLE
+RANDOM_DAILY_TARGET_MB=$RANDOM_DAILY_TARGET_MB
+RANDOM_DAILY_UPLOAD_TARGET_MB=$RANDOM_DAILY_UPLOAD_TARGET_MB
+RANDOM_DAILY_SPEED_MB=$RANDOM_DAILY_SPEED_MB
+RANDOM_DAILY_UPLOAD_SPEED_MB=$RANDOM_DAILY_UPLOAD_SPEED_MB
+RANDOM_UTC_OFFSET=$RANDOM_UTC_OFFSET
+RANDOM_RUN_HOUR_START=$RANDOM_RUN_HOUR_START
+RANDOM_RUN_HOUR_END=$RANDOM_RUN_HOUR_END
+RANDOM_DURATION_MIN=$RANDOM_DURATION_MIN
+RANDOM_INTERVAL_MIN=$RANDOM_INTERVAL_MIN
 EOF
 }
 
@@ -156,6 +190,14 @@ check_hourly_window() {
     return 1
 }
 
+check_random_window() {
+    local current_hour=$(date -u -d "+${RANDOM_UTC_OFFSET} hours" +%H | sed 's/^0//')
+    [ -z "$current_hour" ] && current_hour=0
+    if [ "$current_hour" -ge "$RANDOM_RUN_HOUR_START" ] && [ "$current_hour" -le "$RANDOM_RUN_HOUR_END" ]; then return 0; fi
+    return 1
+}
+
+
 get_dl_url() {
     local n=("nbg1" "fsn1" "hel1" "ash" "hil" "sin")
     echo "https://${n[$((RANDOM % ${#n[@]}))]}-speed.hetzner.com/10GB.bin?r=$RANDOM"
@@ -175,7 +217,7 @@ prepare_upload_data() {
         dd if=/dev/urandom of="$TEMP_DATA_FILE" bs=1M count=2 status=none 2>/dev/null
         if [ $? -ne 0 ]; then
              TEMP_DATA_FILE="$SCRIPT_DIR/chunk.dat"
-             dd if=/dev/urandom of="$TEMP_DATA_FILE" bs=1M count=2 status=none 2>/dev/null
+             dd if=/dev/null of="$TEMP_DATA_FILE" bs=1M count=2 status=none 2>/dev/null
         fi
     fi
 }
@@ -189,7 +231,7 @@ run_traffic() {
     [ -z "$direction" ] && direction="MIX"
 
     IS_SILENT=0
-    if [[ "$mode" == "CRON" || "$mode" == "HOURLY" || "$mode" == "BG" ]]; then IS_SILENT=1; fi
+    if [[ "$mode" == "CRON" || "$mode" == "HOURLY" || "$mode" == "BG" || "$mode" == "RANDOM" ]]; then IS_SILENT=1; fi
 
     local disk_kb=$(df -P "$SCRIPT_DIR" | awk 'NR==2 {print $4}')
     [ -z "$disk_kb" ] && disk_kb=99999999
@@ -229,12 +271,24 @@ run_traffic() {
             local t_sec=$(( HOURLY_DURATION_MIN * 60 ))
             [ "$t_sec" -lt 60 ] && t_sec=60
             calculated_speed_kb=$(awk "BEGIN{printf \"%.0f\", $target_kb / $t_sec}")
+        elif [ "$mode" == "RANDOM" ]; then
+            local t_sec=$(( RANDOM_DURATION_MIN * 60 ))
+            [ "$t_sec" -lt 60 ] && t_sec=60
+            calculated_speed_kb=$(awk "BEGIN{printf \"%.0f\", $target_kb / $t_sec}")
         elif [ "$mode" == "MANUAL" ] || [ "$mode" == "BG" ]; then
             calculated_speed_kb=$speed_kb
         fi
         if [[ "$mode" == "CRON" || "$mode" == "HOURLY" ]]; then
             local cap_kb=$(mb_to_kb "$CRON_MAX_SPEED_MB")
             if [ "${calculated_speed_kb:-0}" -gt "${cap_kb:-0}" ]; then calculated_speed_kb=$cap_kb; fi
+        elif [ "$mode" == "RANDOM" ]; then
+            if [ "$direction" != "UPLOAD_ONLY" ]; then
+                local cap_kb=$(mb_to_kb "$RANDOM_DAILY_SPEED_MB")
+                if [ "${calculated_speed_kb:-0}" -gt "${cap_kb:-0}" ]; then calculated_speed_kb=$cap_kb; fi
+            else
+                local cap_kb=$(mb_to_kb "$RANDOM_DAILY_UPLOAD_SPEED_MB")
+                if [ "${calculated_speed_kb:-0}" -gt "${cap_kb:-0}" ]; then calculated_speed_kb=$cap_kb; fi
+            fi
         fi
         [ "${calculated_speed_kb:-0}" -lt 1024 ] && calculated_speed_kb=1024
         speed_kb=$calculated_speed_kb
@@ -377,6 +431,15 @@ install_cron() {
         if [ "$HOURLY_INTERVAL_MIN" -eq 60 ]; then intv="0 * * * *"; else intv="*/$HOURLY_INTERVAL_MIN * * * *"; fi
         echo "$intv $SCRIPT_PATH --hourly $CRON_MARK" >> "$tmp"
     fi
+    if [ "$RANDOM_MODE_ENABLE" == "1" ]; then
+        local rand_utc_hour=$(( RANDOM_RUN_HOUR_START ))
+        while [ "$rand_utc_hour" -le "$RANDOM_RUN_HOUR_END" ]; do
+            local actual_hour=$(( (RANDOM_UTC_OFFSET - 8 + rand_utc_hour) % 24 ))
+            local min=$(( RANDOM % 60 ))
+            echo "$min $actual_hour * * * $SCRIPT_PATH --random $CRON_MARK" >> "$tmp"
+            rand_utc_hour=$(( rand_utc_hour + RANDOM_INTERVAL_MIN / 60 ))
+        done
+    fi
     crontab "$tmp" && rm -f "$tmp"
     echo -e "${GREEN}Cron 更新成功!${PLAIN} 每日: 本地$svr_h:$BJ_CRON_MIN"
 }
@@ -420,11 +483,79 @@ entry_hourly() {
     run_traffic "HOURLY" "DATA" "$HOURLY_TARGET_MB" "0"
 }
 
+entry_random() {
+    sleep $(( RANDOM % 300 ))
+    load_config
+    if [ "$RANDOM_MODE_ENABLE" != "1" ]; then exit 0; fi
+    if ! check_random_window; then exit 0; fi
+
+    local total_daily_target_kb=$(mb_to_kb "$RANDOM_DAILY_TARGET_MB")
+    local current_daily_kb=$TODAY_KB
+    local remaining_daily_kb=$(( total_daily_target_kb - current_daily_kb ))
+
+    local total_daily_upload_target_kb=$(mb_to_kb "$RANDOM_DAILY_UPLOAD_TARGET_MB")
+    local remaining_daily_upload_kb=$(( total_daily_upload_target_kb - current_daily_kb )) # Assuming upload counts towards daily total
+
+    if [ "$remaining_daily_kb" -le 0 ] && [ "$remaining_daily_upload_kb" -le 0 ]; then
+        log "[Random] 今日流量任务已完成。"
+        exit 0
+    fi
+
+    local run_duration=$(( RANDOM_DURATION_MIN * 60 ))
+    local target_kb=0
+    local direction="MIX"
+
+    if [ "$remaining_daily_kb" -gt 0 ] && [ "$remaining_daily_upload_kb" -gt 0 ]; then
+        if (( RANDOM % 2 == 0 )); then
+            target_kb=$remaining_daily_kb
+            direction="DOWNLOAD"
+        else
+            target_kb=$remaining_daily_upload_kb
+            direction="UPLOAD_ONLY"
+        fi
+    elif [ "$remaining_daily_kb" -gt 0 ]; then
+        target_kb=$remaining_daily_kb
+        direction="DOWNLOAD"
+    elif [ "$remaining_daily_upload_kb" -gt 0 ]; then
+        target_kb=$remaining_daily_upload_kb
+        direction="UPLOAD_ONLY"
+    fi
+
+    local actual_target_mb=$(kb_to_mb "$target_kb")
+    if [ "$actual_target_mb" -lt 10 ]; then
+        log "[Random] 剩余流量过小，跳过。"
+        exit 0
+    fi
+
+    local speed_limit_mb=$RANDOM_DAILY_SPEED_MB
+    local upload_speed_limit_mb=$RANDOM_DAILY_UPLOAD_SPEED_MB
+    if [ "$direction" == "UPLOAD_ONLY" ]; then
+        speed_limit_mb=$RANDOM_DAILY_UPLOAD_SPEED_MB
+        upload_speed_limit_mb=$RANDOM_DAILY_UPLOAD_SPEED_MB
+    fi
+
+    local actual_duration=$RANDOM_DURATION_MIN
+    local speed_kb=$(mb_to_kb "$speed_limit_mb")
+    local duration_sec=$(( (target_kb * 1024) / speed_kb ))
+    if [ "$duration_sec" -lt 60 ]; then
+        actual_duration=$(( duration_sec / 60 ))
+        [ "$actual_duration" -lt 1 ] && actual_duration=1
+    else
+        actual_duration=$(( (duration_sec / 60) ))
+        [ "$actual_duration" -gt "$RANDOM_DURATION_MIN" ] && actual_duration=$RANDOM_DURATION_MIN
+        [ "$actual_duration" -lt 1 ] && actual_duration=1
+    fi
+
+    log "[Random] 启动任务: 目标=${actual_target_mb}MB, 方向=${direction}, 限速=${speed_limit_mb}MB/s, 时长=${actual_duration}分"
+    run_traffic "RANDOM" "DATA" "$actual_target_mb" "$speed_limit_mb" "$direction"
+}
+
+
 menu() {
     while true; do
         clear
         load_config
-        echo -e "${BLUE}=== VPS Traffic Spirit v1.8.0 (Real Traffic) ===${PLAIN}"
+        echo -e "${BLUE}=== VPS Traffic Spirit v1.8.0 (Random Mode) ===${PLAIN}"
         echo -e "${BOLD}[A] 周期保底${PLAIN}"
         echo -e " 1. 周期天数 : ${GREEN}$PERIOD_DAYS${PLAIN} 天"
         echo -e " 2. 周期目标 : ${GREEN}$PERIOD_TARGET_GB${PLAIN} GB"
@@ -437,9 +568,19 @@ menu() {
         echo -e " 7. 任务开关 : $( [ $ENABLE_HOURLY -eq 1 ] && echo "${RED}开启${PLAIN}" || echo "关闭" )"
         echo -e " 8. 触发间隔 : ${GREEN}$HOURLY_INTERVAL_MIN${PLAIN} 分 | 围栏: BJ ${GREEN}$HOURLY_BJ_START-${HOURLY_BJ_END}${PLAIN}点"
         echo -e " 9. 每次跑量 : ${GREEN}$HOURLY_TARGET_MB${PLAIN} MB | 耗时: ${GREEN}$HOURLY_DURATION_MIN${PLAIN} 分"
-        echo -e "${BOLD}[D] 系统参数${PLAIN}"
-        echo -e "10. 挂机上限 : ${GREEN}$CRON_MAX_SPEED_MB${PLAIN} MB/s | 上传开关: $( [ $ENABLE_UPLOAD -eq 1 ] && echo "${RED}ON${PLAIN}" || echo "OFF" )"
-        echo -e "11. 上传比例 : ${GREEN}$UPLOAD_RATIO${PLAIN}% (自动任务默认为3%)"
+        echo -e "${BOLD}[D] 随机模式${PLAIN}"
+        echo -e "10. 启用开关 : $( [ $RANDOM_MODE_ENABLE -eq 1 ] && echo "${RED}开启${PLAIN}" || echo "关闭" )"
+        echo -e "11. 每日下载目标: ${GREEN}$RANDOM_DAILY_TARGET_MB${PLAIN} MB"
+        echo -e "12. 每日上传目标: ${GREEN}$RANDOM_DAILY_UPLOAD_TARGET_MB${PLAIN} MB"
+        echo -e "13. 下载速率: ${GREEN}$RANDOM_DAILY_SPEED_MB${PLAIN} MB/s"
+        echo -e "14. 上传速率: ${GREEN}$RANDOM_DAILY_UPLOAD_SPEED_MB${PLAIN} MB/s"
+        echo -e "15. UTC偏移: UTC${GREEN}${RANDOM_UTC_OFFSET}${PLAIN} (例如: UTC-8)"
+        echo -e "16. 运行时间: ${GREEN}$RANDOM_RUN_HOUR_START${PLAIN}:00 - ${GREEN}$RANDOM_RUN_HOUR_END${PLAIN}:00"
+        echo -e "17. 每次任务时长: ${GREEN}$RANDOM_DURATION_MIN${PLAIN} 分"
+        echo -e "18. 任务间隔: ${GREEN}$RANDOM_INTERVAL_MIN${PLAIN} 分"
+        echo -e "${BOLD}[E] 系统参数${PLAIN}"
+        echo -e "19. 挂机上限 : ${GREEN}$CRON_MAX_SPEED_MB${PLAIN} MB/s | 上传开关: $( [ $ENABLE_UPLOAD -eq 1 ] && echo "${RED}ON${PLAIN}" || echo "OFF" )"
+        echo -e "20. 上传比例 : ${GREEN}$UPLOAD_RATIO${PLAIN}% (自动任务默认为3%)"
         echo -e "----------------------------------------------"
         echo -e " S. 💾 保存配置 | 0. 退出"
         read -p "选项: " c
@@ -456,9 +597,19 @@ menu() {
                read -p "结束时: " e; [ -n "$e" ] && HOURLY_BJ_END=$e ;;
             9) read -p "流量(MB): " t; [ -n "$t" ] && HOURLY_TARGET_MB=$t 
                read -p "耗时(分): " d; [ -n "$d" ] && HOURLY_DURATION_MIN=$d ;;
-            10) read -p "MB/s: " v; [ -n "$v" ] && CRON_MAX_SPEED_MB=$v 
+            10) read -p "1=开, 0=关: " v; [ -n "$v" ] && RANDOM_MODE_ENABLE=$v ;;
+            11) read -p "每日下载目标(MB): " v; [ -n "$v" ] && RANDOM_DAILY_TARGET_MB=$v ;;
+            12) read -p "每日上传目标(MB): " v; [ -n "$v" ] && RANDOM_DAILY_UPLOAD_TARGET_MB=$v ;;
+            13) read -p "下载速率(MB/s): " v; [ -n "$v" ] && RANDOM_DAILY_SPEED_MB=$v ;;
+            14) read -p "上传速率(MB/s): " v; [ -n "$v" ] && RANDOM_DAILY_UPLOAD_SPEED_MB=$v ;;
+            15) read -p "UTC偏移 (e.g., 8 for UTC+8, -8 for UTC-8): " v; [ -n "$v" ] && RANDOM_UTC_OFFSET=$v ;;
+            16) read -p "开始小时 (0-23): " s; [ -n "$s" ] && RANDOM_RUN_HOUR_START=$s
+                read -p "结束小时 (0-23): " e; [ -n "$e" ] && RANDOM_RUN_HOUR_END=$e ;;
+            17) read -p "每次任务时长(分): " v; [ -n "$v" ] && RANDOM_DURATION_MIN=$v ;;
+            18) read -p "任务间隔(分): " v; [ -n "$v" ] && RANDOM_INTERVAL_MIN=$v ;;
+            19) read -p "MB/s: " v; [ -n "$v" ] && CRON_MAX_SPEED_MB=$v 
                 read -p "上传开关 (1=开, 0=关): " u; [ -n "$u" ] && ENABLE_UPLOAD=$u ;;
-            11) read -p "上传比例 (1-100%): " r; [ -n "$r" ] && UPLOAD_RATIO=$r ;;
+            20) read -p "上传比例 (1-100%): " r; [ -n "$r" ] && UPLOAD_RATIO=$r ;;
             s|S) save_config; install_cron; echo -e "${GREEN}保存并重载Cron!${PLAIN}"; sleep 1 ;;
             0) break ;;
         esac
@@ -472,10 +623,11 @@ dashboard() {
     local bg_s="${RED}无${PLAIN}"
     [ -f "$BG_PID_FILE" ] && kill -0 $(cat "$BG_PID_FILE") 2>/dev/null && bg_s="${GREEN}运行中${PLAIN}"
     local smart=$(calc_smart_target)
-    echo -e "${BLUE}=== VPS Traffic Spirit v1.8.0 ===${PLAIN}"
+    echo -e "${BLUE}=== VPS Traffic Spirit v1.8.0 (Random Mode) ===${PLAIN}"
     echo -e " [周期] $(kb_to_gb $PERIOD_KB)/$PERIOD_TARGET_GB GB | 今日: $(kb_to_mb $TODAY_KB) MB"
     echo -e " [智能] 周期保底今日目标: ${YELLOW}$smart MB${PLAIN}"
     echo -e " [小时] $( [ $ENABLE_HOURLY -eq 1 ] && echo "${RED}ON${PLAIN} (每${HOURLY_INTERVAL_MIN}分, $HOURLY_TARGET_MB MB / $HOURLY_DURATION_MIN 分)" || echo "关闭" )"
+    echo -e " [随机] $( [ $RANDOM_MODE_ENABLE -eq 1 ] && echo "${RED}ON${PLAIN} (日目标: ${RANDOM_DAILY_TARGET_MB}MB DL / ${RANDOM_DAILY_UPLOAD_TARGET_MB}MB UL | ${RANDOM_RUN_HOUR_START}-${RANDOM_RUN_HOUR_END} UTC${RANDOM_UTC_OFFSET})" || echo "关闭" )"
     echo -e " [后台] $bg_s"
     echo -e "----------------------------------------------"
     echo -e " 1. 🚀 手动任务 (独立控速)"
@@ -490,6 +642,7 @@ dashboard() {
 case "$1" in
     --cron) entry_cron ;;
     --hourly) entry_hourly ;;
+    --random) entry_random ;;
     --bg-run) run_traffic "BG" "DATA" "$2" "$3" "MIX" ;;
     *)
         while true; do
