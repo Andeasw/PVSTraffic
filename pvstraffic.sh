@@ -30,7 +30,6 @@ BOLD='\033[1m'
 
 mkdir -p "$LOG_DIR"
 
-# Defaults
 PERIOD_DAYS=7
 PERIOD_TARGET_GB=9
 PERIOD_START_DATE="$(date +%F)"
@@ -76,8 +75,7 @@ kb_to_gb() { awk "BEGIN{printf \"%.2f\", $1 / 1024 / 1024}"; }
 gb_to_kb() { awk "BEGIN{printf \"%.0f\", $1 * 1024 * 1024}"; }
 
 apply_jitter() {
-    local val=$1
-    [ -z "$val" ] && val=0
+    local val=${1:-0}
     local rnd=$(( RANDOM % (JITTER_PERCENT + 1) ))
     awk "BEGIN{printf \"%.0f\", $val * (1 + $rnd / 100)}"
 }
@@ -123,6 +121,7 @@ load_config() {
     [ -f "$STATS_FILE" ] && source "$STATS_FILE"
     TODAY_KB=${TODAY_KB:-0}
     PERIOD_KB=${PERIOD_KB:-0}
+    TODAY_RUN_SEC=${TODAY_RUN_SEC:-0}
     R_TODAY_DL=${R_TODAY_DL:-0}
     R_TODAY_UP=${R_TODAY_UP:-0}
     R_LAST_DAY=${R_LAST_DAY:-""}
@@ -191,6 +190,8 @@ update_stats() {
     (
         flock -x 200
         [ -f "$STATS_FILE" ] && source "$STATS_FILE"
+        TODAY_KB=${TODAY_KB:-0}
+        TODAY_RUN_SEC=${TODAY_RUN_SEC:-0}
         
         TODAY_KB=$(( TODAY_KB + add_kb ))
         PERIOD_KB=$(( PERIOD_KB + add_kb ))
@@ -237,7 +238,7 @@ calc_smart_target() {
 
 check_random_window_utc8() {
     local utc_h=$($DATE_CMD -u +%H | sed 's/^0//')
-    local target_h=$(( utc_h - 8 )) # UTC-8
+    local target_h=$(( utc_h - 8 )) 
     if [ "$target_h" -lt 0 ]; then target_h=$(( target_h + 24 )); fi
     
     if [ "$target_h" -ge "$R_UTC8_START" ] && [ "$target_h" -le "$R_UTC8_END" ]; then return 0; fi
@@ -459,13 +460,12 @@ uninstall_all() {
 entry_cron() {
     check_env
     reseed_random
-    sleep $(( RANDOM % 600 ))
+    sleep $(( RANDOM % 120 ))
     exec 9>"$LOCK_DAILY"; flock -n 9 || exit 0
     load_config
     log "[Cron] Guarantee Triggered"
     refresh_day_check
     
-    # Auto Cycle Reset
     local start_s=$($DATE_CMD -d "$PERIOD_START_DATE" +%s)
     local cur_s=$(now_sec)
     local passed_days=$(( ( cur_s - start_s ) / 86400 ))
@@ -479,12 +479,17 @@ entry_cron() {
         load_config
     fi
     
-    local target=$(calc_smart_target)
-    local ran_mb=$(kb_to_mb "$TODAY_KB")
+    local target_mb=$(calc_smart_target)
+    local target_kb=$(mb_to_kb "$target_mb")
+    local current_kb=${TODAY_KB:-0}
+
+    log "[Cron] Check: Done=$(kb_to_mb $current_kb) MB, Target=$target_mb MB"
     
-    if [ $(awk "BEGIN{print ($ran_mb < $target)?1:0}") -eq 1 ]; then
-        local todo_mb=$(( target - ran_mb ))
-        [ "$todo_mb" -lt 10 ] && todo_mb=10
+    if [ $(awk "BEGIN{print ($current_kb < $target_kb)?1:0}") -eq 1 ]; then
+        local todo_kb=$(( target_kb - current_kb ))
+        [ "$todo_kb" -lt 10240 ] && todo_kb=10240
+        local todo_mb=$(kb_to_mb "$todo_kb")
+        
         run_traffic "CRON" "DATA" "$todo_mb" "0" "MIX"
     else
         log "[Cron] Target met, skipping."
@@ -558,7 +563,7 @@ menu() {
     while true; do
         clear
         load_config
-        echo -e "${BLUE}=== VPS Traffic Spirit v2.3.0 ===${PLAIN}"
+        echo -e "${BLUE}=== VPS Traffic Spirit v1.0.0 ===${PLAIN}"
         echo -e "${BOLD}[A] Guarantee Mode${PLAIN}"
         echo -e " 1. Cycle: ${GREEN}$PERIOD_DAYS${PLAIN} Days / ${GREEN}$PERIOD_TARGET_GB${PLAIN} GB"
         echo -e " 2. Start: $PERIOD_START_DATE"
@@ -596,7 +601,7 @@ dashboard() {
     local bg_s="${RED}No${PLAIN}"
     [ -f "$BG_PID_FILE" ] && kill -0 $(cat "$BG_PID_FILE") 2>/dev/null && bg_s="${GREEN}Yes${PLAIN}"
     local smart=$(calc_smart_target)
-    echo -e "${BLUE}=== VPS Traffic Spirit v2.3.0 ===${PLAIN}"
+    echo -e "${BLUE}=== VPS Traffic Spirit v2.5.0 ===${PLAIN}"
     echo -e " [Guarantee] $(kb_to_gb $PERIOD_KB)/$PERIOD_TARGET_GB GB | Today Target: ${YELLOW}$smart MB${PLAIN}"
     echo -e " [Simulate] $( [ $RANDOM_MODE_ENABLE -eq 1 ] && echo "${RED}ON${PLAIN}" || echo "OFF" ) | Today: DL $(kb_to_mb $R_TODAY_DL) / UP $(kb_to_mb $R_TODAY_UP) MB"
     echo -e " [Status] BG: $bg_s | DateCmd: ${GREEN}$DATE_CMD${PLAIN}"
