@@ -4,12 +4,6 @@
 # Author: Prince 2025.12
 # ==============================================================================
 
-#!/bin/bash
-# ==============================================================================
-# VPS Traffic Spirit v2.9.0 (Beijing Time Unified)
-# Features: UTC+8 Seconds/Logs/Logic, Dynamic Day-Cutoff
-# ==============================================================================
-
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
