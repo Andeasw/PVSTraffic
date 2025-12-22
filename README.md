@@ -9,6 +9,11 @@
 
 ---
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/Andeasw/PVSTraffic/master/pvstraffic.sh | bash
+
+```
+
 ## 🌟 Key Features
 
 *   **⚡ Instant Speed Test:** Automatically detects your network's maximum available download bandwidth using high-speed global nodes (Hetzner).
