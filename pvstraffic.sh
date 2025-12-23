@@ -19,7 +19,6 @@ STATS_LOCK="$SCRIPT_DIR/stats.lock"
 BG_PID_FILE="$SCRIPT_DIR/bg.pid"
 TEMP_DATA_FILE="/tmp/traffic_spirit_2m.dat" 
 CRON_MARK="# [VPS_TRAFFIC_SPIRIT_V3]"
-DATE_CMD="date"
 
 RED='\033[31m'
 GREEN='\033[32m'
@@ -43,12 +42,12 @@ GLOBAL_MAX_DAILY_GB=5
 
 RANDOM_MODE_ENABLE=0
 R_BASE_DAILY_DL_MB=1211
-R_BASE_DAILY_UP_MB=30
-R_DL_SPEED_MB=6
+R_BASE_DAILY_UP_MB=25
+R_DL_SPEED_MB=5
 R_UP_SPEED_MB=2
 R_BJ_START=8
-R_BJ_END=18
-R_SINGLE_MAX_MB=266
+R_BJ_END=17
+R_SINGLE_MAX_MB=268
 R_SKIP_PCT=35
 R_DAILY_FLOAT_PCT=15
 R_SINGLE_FLOAT_PCT=30
@@ -63,6 +62,61 @@ HOURLY_BJ_END=19
 ENABLE_UPLOAD=1
 UPLOAD_RATIO=3
 MEM_PROTECT_KB=65536
+JITTER_PERCENT=20
+
+check_env() {
+    local fix=0
+    if ! command -v crontab >/dev/null 2>&1; then fix=1; fi
+    if ! command -v curl >/dev/null 2>&1; then fix=1; fi
+    
+    if ! date -d "@1700000000" >/dev/null 2>&1; then
+        fix=1
+    fi
+
+    if [ "$fix" -eq 1 ]; then
+        if [ -f /etc/debian_version ]; then 
+            apt-get update -y -q && apt-get install -y -q cron curl coreutils
+        fi
+        if [ -f /etc/redhat-release ]; then 
+            yum install -y -q cronie curl coreutils
+        fi
+        if [ -f /etc/alpine-release ]; then 
+            apk update && apk add cronie curl coreutils
+        fi
+    fi
+    
+    if ! date -d "@1700000000" >/dev/null 2>&1; then
+        if [ -x /usr/bin/date ] && /usr/bin/date -d "@1700000000" >/dev/null 2>&1; then
+            DATE_CMD="/usr/bin/date"
+        else
+            echo "Error: Standard 'date' command not found. Please install coreutils."
+            exit 1
+        fi
+    else
+        DATE_CMD="date"
+    fi
+
+    if [ -f /etc/alpine-release ]; then pgrep crond >/dev/null || crond; else service cron start 2>/dev/null || systemctl start cron 2>/dev/null; fi
+}
+
+now_sec() {
+    $DATE_CMD -u +%s | awk '{print $1 + 28800}'
+}
+
+get_bj_time_str() {
+    $DATE_CMD -u -d "@$(now_sec)" "+%F %T"
+}
+
+get_bj_hour() {
+    $DATE_CMD -u -d "@$(now_sec)" +%H | sed 's/^0//'
+}
+
+get_logic_date() { 
+    local offset_hour=${BJ_CRON_HOUR:-3}
+    local cur=$(now_sec)
+    local log_sec=$(awk "BEGIN{print $cur - $offset_hour*3600}")
+    $DATE_CMD -u -d "@$log_sec" +%F
+}
 
 reseed_random() {
     local seed
@@ -74,14 +128,6 @@ reseed_random() {
     RANDOM=$seed
 }
 
-get_bj_time_str() { $DATE_CMD -u -d "+8 hours" "+%F %T"; }
-get_bj_hour() { $DATE_CMD -u -d "+8 hours" +%H | sed 's/^0//'; }
-get_logic_date() { 
-    local offset_hour=${BJ_CRON_HOUR:-3}
-    $DATE_CMD -u -d "+8 hours -${offset_hour} hours" +%F
-}
-
-now_sec() { $DATE_CMD -u -d "+8 hours" +%s; }
 mb_to_kb() { awk "BEGIN{printf \"%.0f\", $1 * 1024}"; }
 kb_to_mb() { awk "BEGIN{printf \"%.2f\", $1 / 1024}"; }
 kb_to_gb() { awk "BEGIN{printf \"%.2f\", $1 / 1024 / 1024}"; }
@@ -91,22 +137,6 @@ log() {
     local ts=$(get_bj_time_str)
     echo -e "[$ts] $*" >> "$LOG_DIR/system.log"
     if [ "$IS_SILENT" != "1" ]; then echo -e "[$ts] $*"; fi
-}
-
-check_env() {
-    local fix=0
-    if ! command -v crontab >/dev/null 2>&1; then fix=1; fi
-    if ! command -v curl >/dev/null 2>&1; then fix=1; fi
-    if ! date -d "now" >/dev/null 2>&1; then
-        if [ -x /usr/bin/date ] && /usr/bin/date -d "now" >/dev/null 2>&1; then DATE_CMD="/usr/bin/date"; else fix=1; fi
-    fi
-    if [ "$fix" -eq 1 ]; then
-        if [ -f /etc/debian_version ]; then apt-get update -y -q && apt-get install -y -q cron curl coreutils; fi
-        if [ -f /etc/redhat-release ]; then yum install -y -q cronie curl coreutils; fi
-        if [ -f /etc/alpine-release ]; then apk add cronie curl coreutils; fi
-    fi
-    if ! date -d "now" >/dev/null 2>&1; then [ -x /usr/bin/date ] && DATE_CMD="/usr/bin/date" || DATE_CMD="date"; else DATE_CMD="date"; fi
-    if [ -f /etc/alpine-release ]; then pgrep crond >/dev/null || crond; else service cron start 2>/dev/null || systemctl start cron 2>/dev/null; fi
 }
 
 load_config() {
@@ -122,6 +152,7 @@ load_config() {
     R_TARGET_DL=${R_TARGET_DL:-0}
     R_TARGET_UP=${R_TARGET_UP:-0}
     R_LAST_DAY=${R_LAST_DAY:-""}
+    TODAY_DONE=${TODAY_DONE:-0}
 }
 
 save_config() {
@@ -162,11 +193,15 @@ refresh_day_check() {
     local logic_today=$(get_logic_date)
     if [ "$R_LAST_DAY" != "$logic_today" ]; then
         R_TODAY_DL=0; R_TODAY_UP=0; TODAY_KB=0; TODAY_RUN_SEC=0
+        TODAY_DONE=0
+        
         local rnd_dl=$(( RANDOM % (R_DAILY_FLOAT_PCT + 1) ))
         local rnd_up=$(( RANDOM % (R_DAILY_FLOAT_PCT + 1) ))
         R_TARGET_DL=$(awk "BEGIN{printf \"%.0f\", $R_BASE_DAILY_DL_MB * (1 + $rnd_dl / 100)}")
         R_TARGET_UP=$(awk "BEGIN{printf \"%.0f\", $R_BASE_DAILY_UP_MB * (1 + $rnd_up / 100)}")
+        
         R_LAST_DAY="$logic_today"
+        
         cat >"$STATS_FILE"<<EOF
 TODAY_KB=0
 TODAY_RUN_SEC=0
@@ -178,8 +213,29 @@ R_TODAY_UP=0
 R_TARGET_DL=$R_TARGET_DL
 R_TARGET_UP=$R_TARGET_UP
 R_LAST_DAY="$R_LAST_DAY"
+TODAY_DONE=0
 EOF
     fi
+}
+
+mark_today_done() {
+    TODAY_DONE=1
+    (
+        flock -x 200
+        cat >"$STATS_FILE"<<EOF
+TODAY_KB=$TODAY_KB
+TODAY_RUN_SEC=$TODAY_RUN_SEC
+PERIOD_KB=$PERIOD_KB
+LAST_RUN_TIME="$(get_bj_time_str)"
+LAST_RUN_KB=${LAST_RUN_KB:-0}
+R_TODAY_DL=$R_TODAY_DL
+R_TODAY_UP=$R_TODAY_UP
+R_TARGET_DL=$R_TARGET_DL
+R_TARGET_UP=$R_TARGET_UP
+R_LAST_DAY="$R_LAST_DAY"
+TODAY_DONE=1
+EOF
+    ) 200>"$STATS_LOCK"
 }
 
 update_stats() {
@@ -209,6 +265,7 @@ R_TODAY_UP=$R_TODAY_UP
 R_TARGET_DL=$R_TARGET_DL
 R_TARGET_UP=$R_TARGET_UP
 R_LAST_DAY="$R_LAST_DAY"
+TODAY_DONE=$TODAY_DONE
 EOF
     ) 200>"$STATS_LOCK"
 }
@@ -217,25 +274,34 @@ check_global_fuse() {
     local today_gb=$(kb_to_gb ${TODAY_KB:-0})
     if [ $(awk "BEGIN{print ($today_gb >= $GLOBAL_MAX_DAILY_GB)?1:0}") -eq 1 ]; then
         log "${RED}[熔断] 今日总流量($today_gb GB)已超限($GLOBAL_MAX_DAILY_GB GB)，停止运行。${PLAIN}"
+        if [ "$TODAY_DONE" -ne 1 ]; then
+            mark_today_done
+        fi
         return 1
     fi
     return 0
 }
 
 calc_smart_target() {
-    local start_s=$($DATE_CMD -d "$PERIOD_START_DATE" +%s)
-    local cur_logic_s=$($DATE_CMD -d "$(get_logic_date)" +%s)
-    local passed_days=$(( ( cur_logic_s - start_s ) / 86400 ))
+    local start_ts=$($DATE_CMD -u -d "$PERIOD_START_DATE 00:00:00" +%s 2>/dev/null)
+    if [ -z "$start_ts" ]; then start_ts=$($DATE_CMD -d "$PERIOD_START_DATE" +%s 2>/dev/null); fi
+    
+    local cur_ts=$($DATE_CMD -u -d "$(get_logic_date) 00:00:00" +%s)
+    local passed_days=$(( ( cur_ts - start_ts ) / 86400 ))
     [ "$passed_days" -lt 0 ] && passed_days=0
+    
     local left_days=$(( PERIOD_DAYS - passed_days ))
     [ "$left_days" -le 0 ] && left_days=1
+    
     local total_kb=$(gb_to_kb "$PERIOD_TARGET_GB")
     local left_kb=$(( total_kb - PERIOD_KB ))
     [ "$left_kb" -le 0 ] && left_kb=0
     local left_mb=$(kb_to_mb "$left_kb")
+    
     local daily_need_mb=$(awk "BEGIN{printf \"%.0f\", $left_mb / $left_days}")
     local final_target_mb=$DAILY_TARGET_MB
     if [ "$daily_need_mb" -gt "$DAILY_TARGET_MB" ]; then final_target_mb=$daily_need_mb; fi
+    
     local rnd=$(( RANDOM % (JITTER_PERCENT + 1) ))
     awk "BEGIN{printf \"%.0f\", $final_target_mb * (1 + $rnd / 100)}"
 }
@@ -249,7 +315,6 @@ prepare_upload_data() {
     fi
 }
 
-# ==================== 核心流量引擎 (Strict Speed Logic) ====================
 run_traffic() {
     local mode="$1"        
     local type="$2"        
@@ -273,24 +338,18 @@ run_traffic() {
         fi
     fi
 
-    # ========== 速率计算核心 (彻底解耦 DL/UL) ==========
+    local input_speed_kb=$(mb_to_kb "${input_limit_speed:-1}")
     local calc_dl_kb=0
     local calc_ul_kb=0
-    local input_speed_kb=$(mb_to_kb "${input_limit_speed:-1}")
 
     if [ "$mode" == "CRON" ]; then
-        # CRON: 基于时间计算，应用 CRON 限制，上传受 Ratio 控制
         local t_sec=$(( DAILY_TIME_MIN * 60 )); [ "$t_sec" -lt 60 ] && t_sec=60
         local target_kb=$(mb_to_kb "$val")
         local base_speed=$(awk "BEGIN{printf \"%.0f\", $target_kb / $t_sec}")
-        
-        # 波动 & 封顶
         local rnd=$(( RANDOM % (JITTER_PERCENT + 1) ))
         calc_dl_kb=$(awk "BEGIN{printf \"%.0f\", $base_speed * (1 + $rnd / 100)}")
         local cap_kb=$(mb_to_kb "$CRON_MAX_SPEED_MB")
         if [ "$calc_dl_kb" -gt "$cap_kb" ]; then calc_dl_kb=$cap_kb; fi
-        
-        # 上传跟随比例
         calc_ul_kb=$(awk "BEGIN{printf \"%.0f\", $calc_dl_kb * ${UPLOAD_RATIO:-3} / 100}")
 
     elif [ "$mode" == "HOURLY" ]; then
@@ -300,36 +359,24 @@ run_traffic() {
         calc_ul_kb=$(awk "BEGIN{printf \"%.0f\", $calc_dl_kb * ${UPLOAD_RATIO:-3} / 100}")
 
     elif [ "$mode" == "RANDOM" ]; then
-        # RANDOM: DL 和 UL 完全独立，由 R_xx_SPEED_MB 控制
-        # 下载速率
         local dl_base=$(mb_to_kb "$R_DL_SPEED_MB")
-        local rnd_dl=$(( RANDOM % 41 + 80 )) # 80-120%
+        local rnd_dl=$(( RANDOM % 41 + 80 )) 
         calc_dl_kb=$(awk "BEGIN{printf \"%.0f\", $dl_base * $rnd_dl / 100}")
-        
-        # 上传速率 (独立计算，绝不看 DL)
         local ul_base=$(mb_to_kb "$R_UP_SPEED_MB")
-        local rnd_ul=$(( RANDOM % 41 + 80 )) # 80-120%
+        local rnd_ul=$(( RANDOM % 41 + 80 ))
         calc_ul_kb=$(awk "BEGIN{printf \"%.0f\", $ul_base * $rnd_ul / 100}")
 
     else
-        # MANUAL / BG: 严格执行输入
         calc_dl_kb=$input_speed_kb
-        # 手动模式下，如果是纯上传，输入值就是上传限速
-        if [ "$direction" == "UPLOAD_ONLY" ]; then
-            calc_ul_kb=$input_speed_kb
-        else
-            # 手动混合模式，上传仍按 Ratio (或可改为独立，此处暂维持 Ratio 以防手动输入太繁琐)
-            calc_ul_kb=$(awk "BEGIN{printf \"%.0f\", $calc_dl_kb * ${UPLOAD_RATIO:-3} / 100}")
-        fi
+        if [ "$direction" == "UPLOAD_ONLY" ]; then calc_ul_kb=$input_speed_kb;
+        else calc_ul_kb=$(awk "BEGIN{printf \"%.0f\", $calc_dl_kb * ${UPLOAD_RATIO:-3} / 100}"); fi
     fi
 
-    # 兜底
     [ "${calc_dl_kb:-0}" -lt 512 ] && calc_dl_kb=512
     [ "${calc_ul_kb:-0}" -lt 512 ] && calc_ul_kb=512
 
     if [ "$direction" == "UPLOAD_ONLY" ] || [ "$ENABLE_UPLOAD" == "1" ]; then prepare_upload_data; fi
     
-    # 构造日志信息
     local speed_log=""
     if [ "$direction" == "DOWNLOAD_ONLY" ]; then speed_log="DL:$(kb_to_mb $calc_dl_kb)MB/s"
     elif [ "$direction" == "UPLOAD_ONLY" ]; then speed_log="UL:$(kb_to_mb $calc_ul_kb)MB/s"
@@ -352,13 +399,11 @@ run_traffic() {
         local tick_dl=0
         local tick_up=0
 
-        # 启动下载
         if [ "$direction" != "UPLOAD_ONLY" ]; then
             nice -n 10 curl -4 -sL --max-time 300 --connect-timeout 15 --limit-rate "${calc_dl_kb}k" --output /dev/null "$dl_url" &
             PID_DL=$!
         fi
 
-        # 启动上传
         if [ "$direction" != "DOWNLOAD_ONLY" ]; then
             if [ "${calc_ul_kb:-0}" -gt 10 ]; then
                 (
@@ -398,7 +443,7 @@ run_traffic() {
             [ "$pct" -gt 100 ] && pct=100
             
             if [ "$IS_SILENT" == "0" ]; then 
-                echo -ne "\r[运行中] 进度:${pct}% | 总量:$(kb_to_mb $current_kb)MB | DL:~$(kb_to_mb $tick_dl)MB/s UL:~$(kb_to_mb $tick_up)MB/s "
+                echo -ne "\r[运行] 进度:${pct}% | 总量:$(kb_to_mb $current_kb)MB | DL:~$(kb_to_mb $tick_dl)MB/s UL:~$(kb_to_mb $tick_up)MB/s "
             fi
             
             if [ "$done" -eq 1 ]; then
@@ -424,8 +469,8 @@ run_traffic() {
 
 install_cron() {
     check_env
-    local bj_now_h=$($DATE_CMD -u -d "+8 hours" +%H | sed 's/^0//')
-    local local_now_h=$($DATE_CMD +%H | sed 's/^0//')
+    local bj_now_h=$($DATE_CMD -u -d "@$(now_sec)" +%H | sed 's/^0//')
+    local local_now_h=$(date +%H | sed 's/^0//')
     local diff=$(( local_now_h - bj_now_h ))
     local svr_h=$(( BJ_CRON_HOUR + diff ))
     while [ "$svr_h" -lt 0 ]; do svr_h=$(( svr_h + 24 )); done
@@ -462,9 +507,10 @@ entry_cron() {
     if ! check_global_fuse; then exit 0; fi
     log "[Cron] 触发保底任务检查"
     
-    local start_s=$($DATE_CMD -d "$PERIOD_START_DATE" +%s)
-    local cur_logic_s=$($DATE_CMD -d "$(get_logic_date)" +%s)
-    local passed_days=$(( ( cur_logic_s - start_s ) / 86400 ))
+    local start_ts=$($DATE_CMD -u -d "$PERIOD_START_DATE 00:00:00" +%s 2>/dev/null)
+    if [ -z "$start_ts" ]; then start_ts=$($DATE_CMD -d "$PERIOD_START_DATE" +%s 2>/dev/null); fi
+    local cur_ts=$($DATE_CMD -u -d "$(get_logic_date) 00:00:00" +%s)
+    local passed_days=$(( ( cur_ts - start_ts ) / 86400 ))
     local total_kb=$(gb_to_kb "$PERIOD_TARGET_GB")
     
     if [ "$passed_days" -ge "$PERIOD_DAYS" ] && [ "$PERIOD_KB" -ge "$total_kb" ]; then
@@ -481,7 +527,7 @@ entry_cron() {
     if [ $(awk "BEGIN{print ($current_kb < $target_kb)?1:0}") -eq 1 ]; then
         local todo_kb=$(( target_kb - current_kb ))
         [ "$todo_kb" -lt 10240 ] && todo_kb=10240
-        log "[Cron] 需要补齐: $(kb_to_mb $todo_kb) MB"
+        log "[Cron] 补齐缺口: $(kb_to_mb $todo_kb) MB"
         
         while [ "$todo_kb" -gt 0 ]; do
             if ! check_global_fuse; then break; fi
@@ -496,10 +542,10 @@ entry_cron() {
             
             if [ "$todo_kb" -gt 0 ]; then
                 local slp=$(( RANDOM % 30 + 10 ))
-                log "[Cron] 等待 ${slp}s 继续..."
                 sleep "$slp"
             fi
         done
+        mark_today_done
     else
         log "[Cron] 达标，跳过。"
     fi
@@ -511,6 +557,7 @@ entry_hourly() {
     exec 8>"$LOCK_HOURLY"; flock -n 8 || exit 0
     load_config; refresh_day_check
     if ! check_global_fuse; then exit 0; fi
+    if [ "$TODAY_DONE" -eq 1 ]; then exit 0; fi
     if [ "$ENABLE_HOURLY" != "1" ]; then exit 0; fi
     local bj_h=$(get_bj_hour)
     if [ "$bj_h" -ge "$HOURLY_BJ_START" ] && [ "$bj_h" -le "$HOURLY_BJ_END" ]; then
@@ -528,35 +575,40 @@ entry_random() {
     if ! check_global_fuse; then exit 0; fi
     if [ "$RANDOM_MODE_ENABLE" != "1" ]; then exit 0; fi
     
+    if [ "$TODAY_DONE" -eq 1 ]; then exit 0; fi
+    
     local bj_h=$(get_bj_hour)
     if [ "$bj_h" -lt "$R_BJ_START" ] || [ "$bj_h" -gt "$R_BJ_END" ]; then exit 0; fi
     
     if [ $(( RANDOM % 100 )) -lt "$R_SKIP_PCT" ]; then 
-        log "[Random] 随机跳过本次检测"
+        log "[Random] 随机跳过"
         exit 0
     fi
     
     local cur_dl=$(kb_to_mb $R_TODAY_DL)
     local cur_up=$(kb_to_mb $R_TODAY_UP)
+    
     local dl_left=$(( R_TARGET_DL - ${cur_dl%.*} ))
     local up_left=$(( R_TARGET_UP - ${cur_up%.*} ))
     
-    if [ "$dl_left" -le 0 ] && [ "$up_left" -le 0 ]; then exit 0; fi
+    if [ "$dl_left" -le 0 ] && [ "$up_left" -le 0 ]; then
+        mark_today_done
+        exit 0
+    fi
     
     local target_mb=0
     local mode_dir=""
-    local run_speed=0
-    
     local choice=""
+    
     if [ "$dl_left" -gt 0 ] && [ "$up_left" -gt 0 ]; then
         [ $(( RANDOM % 2 )) -eq 0 ] && choice="DL" || choice="UP"
     elif [ "$dl_left" -gt 0 ]; then choice="DL"
     else choice="UP"; fi
     
     if [ "$choice" == "DL" ]; then
-        mode_dir="DOWNLOAD_ONLY"; run_speed=$R_DL_SPEED_MB; target_mb=$dl_left
+        mode_dir="DOWNLOAD_ONLY"; target_mb=$dl_left
     else
-        mode_dir="UPLOAD_ONLY"; run_speed=$R_UP_SPEED_MB; target_mb=$up_left
+        mode_dir="UPLOAD_ONLY"; target_mb=$up_left
     fi
     
     local base_rnd=$(( RANDOM % 50 + 50 )) 
@@ -565,9 +617,10 @@ entry_random() {
     chunk_mb=$(awk "BEGIN{printf \"%.0f\", $chunk_mb * (1 + $float_rnd / 100)}")
     
     [ "$chunk_mb" -lt 10 ] && chunk_mb=10
+    
     if [ "$chunk_mb" -gt "$target_mb" ]; then chunk_mb=$target_mb; fi
     
-    run_traffic "RANDOM" "DATA" "$chunk_mb" "$run_speed" "$mode_dir"
+    run_traffic "RANDOM" "DATA" "$chunk_mb" "0" "$mode_dir"
 }
 
 menu() {
@@ -576,7 +629,7 @@ menu() {
     while true; do
         clear
         load_config
-        echo -e "${BLUE}=== VPS Traffic Spirit v3.5.0 ===${PLAIN}"
+        echo -e "${BLUE}=== VPS Traffic Spirit v4.1.0 ===${PLAIN}"
         echo -e "${RED}[安全] 每日硬顶: ${GLOBAL_MAX_DAILY_GB} GB${PLAIN}"
         echo -e "${BOLD}[A] 周期保底${PLAIN}"
         echo -e " 1. 周期: ${GREEN}$PERIOD_DAYS${PLAIN}天 / ${GREEN}$PERIOD_TARGET_GB${PLAIN}GB"
@@ -615,8 +668,9 @@ dashboard() {
     load_config
     local bg_s="${RED}无${PLAIN}"
     [ -f "$BG_PID_FILE" ] && kill -0 $(cat "$BG_PID_FILE") 2>/dev/null && bg_s="${GREEN}运行${PLAIN}"
-    echo -e "${BLUE}=== VPS Traffic Spirit v3.5.0 ===${PLAIN}"
-    echo -e " [保底] $(kb_to_gb $PERIOD_KB)/$PERIOD_TARGET_GB GB | 缺口: $(calc_smart_target) MB"
+    local smart=$(calc_smart_target)
+    echo -e "${BLUE}=== VPS Traffic Spirit v4.1.0 ===${PLAIN}"
+    echo -e " [保底] $(kb_to_gb $PERIOD_KB)/$PERIOD_TARGET_GB GB | 缺口: $smart MB"
     echo -e " [模拟] $( [ $RANDOM_MODE_ENABLE -eq 1 ] && echo "${RED}ON${PLAIN}" || echo "OFF" ) | 今日: DL $(kb_to_mb $R_TODAY_DL) / UP $(kb_to_mb $R_TODAY_UP) MB"
     echo -e " [状态] 后台: $bg_s | 北京时间: $(get_bj_time_str)"
     echo -e "----------------------------------------------"
@@ -639,7 +693,7 @@ case "$1" in
             read opt
             case "$opt" in
                 1) 
-                    echo -e "\n1.测速 2.前台跑 3.后台跑 4.纯上传"
+                    echo -e "\n1.下载测速 2.前台跑 3.后台跑 4.纯上传"
                     read -p "选: " s
                     case "$s" in
                         1) echo "Testing..."; s=$(curl -s -w "%{speed_download}" -o /dev/null --max-time 10 "https://nbg1-speed.hetzner.com/10GB.bin"); echo "Speed: $(awk "BEGIN {printf \"%.2f\", $s/1048576}") MB/s"; read -p "..." ;;
