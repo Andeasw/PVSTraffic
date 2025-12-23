@@ -32,22 +32,22 @@ mkdir -p "$LOG_DIR"
 PERIOD_DAYS=7
 PERIOD_TARGET_GB=9
 PERIOD_START_DATE="" 
-DAILY_TARGET_MB=1111
-DAILY_TIME_MIN=85
+DAILY_TARGET_MB=1222
+DAILY_TIME_MIN=90
 CRON_MAX_SPEED_MB=8
 BJ_CRON_HOUR=3
-BJ_CRON_MIN=35
+BJ_CRON_MIN=10
 
 GLOBAL_MAX_DAILY_GB=5
 
 RANDOM_MODE_ENABLE=0
-R_BASE_DAILY_DL_MB=1266
-R_BASE_DAILY_UP_MB=25
+R_BASE_DAILY_DL_MB=1111
+R_BASE_DAILY_UP_MB=20
 R_DL_SPEED_MB=6
 R_UP_SPEED_MB=2
 R_BJ_START=7
 R_BJ_END=18
-R_SINGLE_MAX_MB=266
+R_SINGLE_MAX_MB=268
 R_SKIP_PCT=35
 R_DAILY_FLOAT_PCT=15
 R_SINGLE_FLOAT_PCT=30
@@ -102,18 +102,14 @@ reseed_random() {
 }
 
 get_random_ua() {
-    local v_chrome=$((RANDOM % 10 + 121))
-    local v_edge=$((RANDOM % 10 + 120))
-    local v_safari=$((RANDOM % 5 + 15))
-    local platform=$((RANDOM % 5))
-    
-    case $platform in
-        0) echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${v_chrome}.0.0.0 Safari/537.36" ;;
-        1) echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${v_chrome}.0.0.0 Safari/537.36 Edg/${v_edge}.0.0.0" ;;
-        2) echo "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/${v_safari}.2 Safari/605.1.15" ;;
-        3) echo "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1" ;;
-        4) echo "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${v_chrome}.0.0.0 Mobile Safari/537.36" ;;
-    esac
+    local uas=(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0"
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1"
+        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36"
+    )
+    echo "${uas[$((RANDOM % ${#uas[@]}))]}"
 }
 
 mb_to_kb() { awk "BEGIN{printf \"%.0f\", $1 * 1024}"; }
@@ -275,12 +271,12 @@ calc_smart_target() {
 }
 
 get_dl_url() {
-    local u=("https://nbg1-speed.hetzner.com/10GB.bin" "https://fsn1-speed.hetzner.com/10GB.bin" "https://hel1-speed.hetzner.com/10GB.bin" "https://ash-speed.hetzner.com/10GB.bin" "http://speedtest.tele2.net/10GB.zip" "http://ipv4.download.thinkbroadband.com/1GB.zip" "http://mirror.leaseweb.com/speedtest/10000mb.bin")
+    local u=("https://nbg1-speed.hetzner.com/10GB.bin" "https://fsn1-speed.hetzner.com/10GB.bin" "https://hel1-speed.hetzner.com/10GB.bin" "https://ash-speed.hetzner.com/10GB.bin" "https://speedtest.tele2.net/10GB.zip" "https://scaleway.testdebit.info/10G.bin" "https://bouygues.testdebit.info/10G.bin")
     echo "${u[$((RANDOM % ${#u[@]}))]}?r=$RANDOM"
 }
 
 get_up_url() {
-    local u=("http://speedtest.tele2.net/upload.php" "http://ipv4.speedtest.tele2.net/upload.php" "http://bouygues.testdebit.info/ul/upload.php" "http://test.kabeldeutschland.de/upload.php" "http://proof.ovh.net/files/" "http://scaleway.testdebit.info/ul/upload.php")
+    local u=("https://speedtest.tele2.net/upload.php" "https://bouygues.testdebit.info/ul/upload.php" "https://scaleway.testdebit.info/ul/upload.php" "https://proof.ovh.net/upload.php")
     echo "${u[$((RANDOM % ${#u[@]}))]}"
 }
 
@@ -358,7 +354,7 @@ run_traffic() {
         local ua=$(get_random_ua)
 
         if [ "$direction" != "UPLOAD_ONLY" ]; then
-            nice -n 10 curl -4 -sL -A "$ua" --max-time 300 --connect-timeout 15 --limit-rate "${calc_dl_kb}k" --output /dev/null "$dl_url" &
+            nice -n 10 curl -4 -sL -k -A "$ua" --fail --connect-timeout 5 --max-time 300 --limit-rate "${calc_dl_kb}k" --output /dev/null "$dl_url" &
             PID_DL=$!
         fi
 
@@ -367,14 +363,15 @@ run_traffic() {
                 (
                     PARENT_PID=$$; ulimit -v 32768
                     while kill -0 "$PARENT_PID" 2>/dev/null; do
-                        nice -n 15 curl -4 -sL -A "$ua" \
+                        nice -n 15 curl -4 -sL -k -A "$ua" \
                              -H "Content-Type: application/octet-stream" \
                              -H "Expect:" \
-                             --max-time 60 --connect-timeout 10 \
+                             --fail --connect-timeout 5 --max-time 60 \
                              --limit-rate "${calc_ul_kb}k" \
                              --data-binary "@$TEMP_DATA_FILE" \
                              "$up_url" --output /dev/null 2>/dev/null
-                        sleep 0.2
+                        # 如果curl失败（退出码非0），短暂休眠后继续，自动换URL
+                        if [ $? -ne 0 ]; then sleep 1; fi
                     done
                 ) &
                 PID_UP=$!
@@ -415,10 +412,13 @@ run_traffic() {
             fi
         done
         
+        # 进程结束后的处理
         [ -n "$PID_DL" ] && kill $PID_DL 2>/dev/null
         [ -n "$PID_UP" ] && kill $PID_UP 2>/dev/null
         wait $PID_DL $PID_UP 2>/dev/null
-        if [ "$IS_SILENT" == "1" ]; then sleep $(( RANDOM % 5 + 1 )); fi
+        
+        # 如果是因为失败退出（非完成），则立即重试（更换URL）
+        if [ "$IS_SILENT" == "1" ]; then sleep $(( RANDOM % 3 + 1 )); fi
     done
     
     local dur=$(( $(now_sec) - start_ts ))
@@ -583,7 +583,7 @@ menu() {
     while true; do
         clear
         load_config
-        echo -e "${BLUE}=== VPS Traffic Spirit v4.5.0 ===${PLAIN}"
+        echo -e "${BLUE}=== VPS Traffic Spirit v4.6.0 ===${PLAIN}"
         echo -e "${RED}[安全] 每日硬顶: ${GLOBAL_MAX_DAILY_GB} GB${PLAIN}"
         echo -e "${BOLD}[A] 周期保底${PLAIN}"
         echo -e " 1. 周期: ${GREEN}$PERIOD_DAYS${PLAIN}天 / ${GREEN}$PERIOD_TARGET_GB${PLAIN}GB"
