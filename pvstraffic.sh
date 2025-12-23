@@ -32,8 +32,8 @@ mkdir -p "$LOG_DIR"
 PERIOD_DAYS=7
 PERIOD_TARGET_GB=9
 PERIOD_START_DATE="" 
-DAILY_TARGET_MB=1222
-DAILY_TIME_MIN=90
+DAILY_TARGET_MB=1111
+DAILY_TIME_MIN=85
 CRON_MAX_SPEED_MB=8
 BJ_CRON_HOUR=3
 BJ_CRON_MIN=10
@@ -41,13 +41,13 @@ BJ_CRON_MIN=10
 GLOBAL_MAX_DAILY_GB=5
 
 RANDOM_MODE_ENABLE=0
-R_BASE_DAILY_DL_MB=1111
-R_BASE_DAILY_UP_MB=20
+R_BASE_DAILY_DL_MB=1122
+R_BASE_DAILY_UP_MB=268
 R_DL_SPEED_MB=6
 R_UP_SPEED_MB=2
 R_BJ_START=7
-R_BJ_END=18
-R_SINGLE_MAX_MB=268
+R_BJ_END=17
+R_SINGLE_MAX_MB=277
 R_SKIP_PCT=35
 R_DAILY_FLOAT_PCT=15
 R_SINGLE_FLOAT_PCT=30
@@ -104,10 +104,10 @@ reseed_random() {
 get_random_ua() {
     local uas=(
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15"
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0"
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1"
-        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0"
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+        "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36"
     )
     echo "${uas[$((RANDOM % ${#uas[@]}))]}"
 }
@@ -276,7 +276,7 @@ get_dl_url() {
 }
 
 get_up_url() {
-    local u=("https://speedtest.tele2.net/upload.php" "https://bouygues.testdebit.info/ul/upload.php" "https://scaleway.testdebit.info/ul/upload.php" "https://proof.ovh.net/upload.php")
+    local u=("https://speedtest.tele2.net/upload.php" "https://bouygues.testdebit.info/ul/upload.php" "https://scaleway.testdebit.info/ul/upload.php")
     echo "${u[$((RANDOM % ${#u[@]}))]}"
 }
 
@@ -347,14 +347,14 @@ run_traffic() {
     
     local start_ts=$(now_sec); local current_kb=0; local dl_acc=0; local up_acc=0
     trap 'pkill -P $$; rm -f "$BG_PID_FILE"; exit' EXIT INT TERM
+    local ua=$(get_random_ua)
 
     while true; do
         local dl_url=$(get_dl_url); local up_url=$(get_up_url) 
         local PID_DL=""; local PID_UP=""; local tick_dl=0; local tick_up=0
-        local ua=$(get_random_ua)
 
         if [ "$direction" != "UPLOAD_ONLY" ]; then
-            nice -n 10 curl -4 -sL -k -A "$ua" --fail --connect-timeout 5 --max-time 300 --limit-rate "${calc_dl_kb}k" --output /dev/null "$dl_url" &
+            nice -n 10 curl -4 -sL -A "$ua" --fail --connect-timeout 5 --max-time 300 --limit-rate "${calc_dl_kb}k" --output /dev/null "$dl_url" &
             PID_DL=$!
         fi
 
@@ -363,15 +363,14 @@ run_traffic() {
                 (
                     PARENT_PID=$$; ulimit -v 32768
                     while kill -0 "$PARENT_PID" 2>/dev/null; do
-                        nice -n 15 curl -4 -sL -k -A "$ua" \
+                        nice -n 15 curl -4 -sL -A "$ua" \
                              -H "Content-Type: application/octet-stream" \
                              -H "Expect:" \
                              --fail --connect-timeout 5 --max-time 60 \
                              --limit-rate "${calc_ul_kb}k" \
                              --data-binary "@$TEMP_DATA_FILE" \
                              "$up_url" --output /dev/null 2>/dev/null
-                        # 如果curl失败（退出码非0），短暂休眠后继续，自动换URL
-                        if [ $? -ne 0 ]; then sleep 1; fi
+                        if [ $? -ne 0 ]; then sleep $((RANDOM % 3 + 2)); fi
                     done
                 ) &
                 PID_UP=$!
@@ -383,6 +382,8 @@ run_traffic() {
             sleep 1
             local elapsed=$(( $(now_sec) - start_ts ))
             tick_dl=0; tick_up=0
+            
+            # 精确统计：进程存在才计入
             if [ -n "$PID_DL" ] && kill -0 $PID_DL 2>/dev/null; then tick_dl=$calc_dl_kb; fi
             if [ -n "$PID_UP" ] && kill -0 $PID_UP 2>/dev/null; then tick_up=$calc_ul_kb; fi
             
@@ -412,13 +413,10 @@ run_traffic() {
             fi
         done
         
-        # 进程结束后的处理
         [ -n "$PID_DL" ] && kill $PID_DL 2>/dev/null
         [ -n "$PID_UP" ] && kill $PID_UP 2>/dev/null
         wait $PID_DL $PID_UP 2>/dev/null
-        
-        # 如果是因为失败退出（非完成），则立即重试（更换URL）
-        if [ "$IS_SILENT" == "1" ]; then sleep $(( RANDOM % 3 + 1 )); fi
+        if [ "$IS_SILENT" == "1" ]; then sleep $(( RANDOM % 5 + 1 )); fi
     done
     
     local dur=$(( $(now_sec) - start_ts ))
@@ -541,8 +539,29 @@ entry_random() {
     local bj_h=$(get_bj_hour)
     if [ "$bj_h" -lt "$R_BJ_START" ] || [ "$bj_h" -gt "$R_BJ_END" ]; then exit 0; fi
     
-    if [ $(( RANDOM % 100 )) -lt "$R_SKIP_PCT" ]; then 
-        log "[Random] 随机跳过"
+    # 智能配速 (Smart Pacing)
+    local duration=$(( R_BJ_END - R_BJ_START ))
+    [ "$duration" -le 0 ] && duration=12
+    local elapsed=$(( bj_h - R_BJ_START ))
+    local time_pct=$(( elapsed * 100 / duration ))
+    
+    # 计算当前流量进度
+    local dl_target=${R_TARGET_DL:-1}
+    local dl_usage=${R_TODAY_DL:-0}
+    local data_pct=$(( dl_usage * 100 / dl_target ))
+    
+    local dynamic_skip=$R_SKIP_PCT
+    
+    if [ "$data_pct" -gt "$(( time_pct + 15 ))" ]; then
+        dynamic_skip=85 # 跑太快，强行减速
+        log "[Smart] 进度偏快(${data_pct}% > ${time_pct}%)，主动避让"
+    elif [ "$data_pct" -lt "$(( time_pct - 10 ))" ]; then
+        dynamic_skip=10 # 跑太慢，积极补课
+        log "[Smart] 进度偏慢(${data_pct}% < ${time_pct}%)，积极补课"
+    fi
+    
+    if [ $(( RANDOM % 100 )) -lt "$dynamic_skip" ]; then 
+        log "[Random] 随机跳过 (概率${dynamic_skip}%)"
         exit 0
     fi
     
@@ -583,7 +602,7 @@ menu() {
     while true; do
         clear
         load_config
-        echo -e "${BLUE}=== VPS Traffic Spirit v4.6.0 ===${PLAIN}"
+        echo -e "${BLUE}=== VPS Traffic Spirit v4.8.0 ===${PLAIN}"
         echo -e "${RED}[安全] 每日硬顶: ${GLOBAL_MAX_DAILY_GB} GB${PLAIN}"
         echo -e "${BOLD}[A] 周期保底${PLAIN}"
         echo -e " 1. 周期: ${GREEN}$PERIOD_DAYS${PLAIN}天 / ${GREEN}$PERIOD_TARGET_GB${PLAIN}GB"
