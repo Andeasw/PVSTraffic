@@ -18,7 +18,7 @@ LOCK_RANDOM="$SCRIPT_DIR/random.lock"
 STATS_LOCK="$SCRIPT_DIR/stats.lock"
 BG_PID_FILE="$SCRIPT_DIR/bg.pid"
 TEMP_DATA_FILE="/tmp/traffic_spirit_2m.dat" 
-CRON_MARK="# [VPS_TRAFFIC_SPIRIT_V3]"
+CRON_MARK="# [VPS_TRAFFIC_SPIRIT_V2]"
 
 RED='\033[31m'
 GREEN='\033[32m'
@@ -30,39 +30,43 @@ BOLD='\033[1m'
 mkdir -p "$LOG_DIR"
 
 PERIOD_DAYS=7
-PERIOD_TARGET_GB=9
+PERIOD_TARGET_GB=10
 PERIOD_START_DATE="" 
-DAILY_TARGET_MB=1111
+DAILY_TARGET_MB=1205
 DAILY_TIME_MIN=85
 CRON_MAX_SPEED_MB=8
 BJ_CRON_HOUR=3
 BJ_CRON_MIN=10
 
-GLOBAL_MAX_DAILY_GB=5
+GLOBAL_MAX_DAILY_GB=6
 
 RANDOM_MODE_ENABLE=0
-R_BASE_DAILY_DL_MB=1122
-R_BASE_DAILY_UP_MB=20
-R_DL_SPEED_MB=6
+R_BASE_DAILY_DL_MB=1155
+R_BASE_DAILY_UP_MB=10
+R_DL_SPEED_MB=7
 R_UP_SPEED_MB=2
 R_BJ_START=7
-R_BJ_END=17
-R_SINGLE_MAX_MB=277
-R_SKIP_PCT=35
+R_BJ_END=16
+R_SINGLE_MAX_MB=285
+R_SKIP_PCT=30
 R_DAILY_FLOAT_PCT=15
-R_SINGLE_FLOAT_PCT=30
+R_SINGLE_FLOAT_PCT=25
 
 ENABLE_HOURLY=0
 HOURLY_INTERVAL_MIN=60
-HOURLY_TARGET_MB=150
+HOURLY_TARGET_MB=100
 HOURLY_DURATION_MIN=5
 HOURLY_BJ_START=9
-HOURLY_BJ_END=19
+HOURLY_BJ_END=20
 
 ENABLE_UPLOAD=1
 UPLOAD_RATIO=3
 MEM_PROTECT_KB=65536
-JITTER_PERCENT=20
+JITTER_PERCENT=25
+
+LAZY_CHANCE_PCT=20
+UPLOAD_DAY_CHANCE_PCT=20
+REAL_SOURCE_MIX_PCT=60
 
 check_env() {
     local fix=0
@@ -106,8 +110,8 @@ get_random_ua() {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0"
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
-        "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36"
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0"
     )
     echo "${uas[$((RANDOM % ${#uas[@]}))]}"
 }
@@ -136,6 +140,8 @@ load_config() {
     R_TARGET_UP=${R_TARGET_UP:-0}
     R_LAST_DAY=${R_LAST_DAY:-""}
     TODAY_DONE=${TODAY_DONE:-0}
+    TODAY_SKIP=${TODAY_SKIP:-0}
+    TODAY_UP_EN=${TODAY_UP_EN:-1}
 }
 
 save_config() {
@@ -169,6 +175,9 @@ R_SINGLE_MAX_MB=$R_SINGLE_MAX_MB
 R_SKIP_PCT=$R_SKIP_PCT
 R_DAILY_FLOAT_PCT=$R_DAILY_FLOAT_PCT
 R_SINGLE_FLOAT_PCT=$R_SINGLE_FLOAT_PCT
+LAZY_CHANCE_PCT=$LAZY_CHANCE_PCT
+UPLOAD_DAY_CHANCE_PCT=$UPLOAD_DAY_CHANCE_PCT
+REAL_SOURCE_MIX_PCT=$REAL_SOURCE_MIX_PCT
 EOF
 }
 
@@ -180,6 +189,13 @@ refresh_day_check() {
         local rnd_up=$(( RANDOM % (R_DAILY_FLOAT_PCT + 1) ))
         R_TARGET_DL=$(awk "BEGIN{printf \"%.0f\", $R_BASE_DAILY_DL_MB * (1 + $rnd_dl / 100)}")
         R_TARGET_UP=$(awk "BEGIN{printf \"%.0f\", $R_BASE_DAILY_UP_MB * (1 + $rnd_up / 100)}")
+        
+        TODAY_SKIP=0
+        if [ $(( RANDOM % 100 )) -lt "${LAZY_CHANCE_PCT:-20}" ]; then TODAY_SKIP=1; fi
+        
+        TODAY_UP_EN=0
+        if [ $(( RANDOM % 100 )) -lt "${UPLOAD_DAY_CHANCE_PCT:-20}" ]; then TODAY_UP_EN=1; fi
+
         R_LAST_DAY="$logic_today"
         cat >"$STATS_FILE"<<EOF
 TODAY_KB=0
@@ -193,6 +209,8 @@ R_TARGET_DL=$R_TARGET_DL
 R_TARGET_UP=$R_TARGET_UP
 R_LAST_DAY="$R_LAST_DAY"
 TODAY_DONE=0
+TODAY_SKIP=$TODAY_SKIP
+TODAY_UP_EN=$TODAY_UP_EN
 EOF
     fi
 }
@@ -211,6 +229,8 @@ R_TARGET_DL=$R_TARGET_DL
 R_TARGET_UP=$R_TARGET_UP
 R_LAST_DAY="$R_LAST_DAY"
 TODAY_DONE=1
+TODAY_SKIP=$TODAY_SKIP
+TODAY_UP_EN=$TODAY_UP_EN
 EOF
     ) 200>"$STATS_LOCK"
 }
@@ -237,6 +257,8 @@ R_TARGET_DL=$R_TARGET_DL
 R_TARGET_UP=$R_TARGET_UP
 R_LAST_DAY="$R_LAST_DAY"
 TODAY_DONE=$TODAY_DONE
+TODAY_SKIP=$TODAY_SKIP
+TODAY_UP_EN=$TODAY_UP_EN
 EOF
     ) 200>"$STATS_LOCK"
 }
@@ -244,7 +266,7 @@ EOF
 check_global_fuse() {
     local today_gb=$(kb_to_gb ${TODAY_KB:-0})
     if [ $(awk "BEGIN{print ($today_gb >= $GLOBAL_MAX_DAILY_GB)?1:0}") -eq 1 ]; then
-        log "${RED}[熔断] 今日($today_gb GB)超限($GLOBAL_MAX_DAILY_GB GB)，停机。${PLAIN}"
+        log "${RED}[熔断] 今日($today_gb GB)已达限($GLOBAL_MAX_DAILY_GB GB)，强制停机。${PLAIN}"
         [ "$TODAY_DONE" -ne 1 ] && mark_today_done
         return 1
     fi
@@ -271,8 +293,24 @@ calc_smart_target() {
 }
 
 get_dl_url() {
-    local u=("https://nbg1-speed.hetzner.com/10GB.bin" "https://fsn1-speed.hetzner.com/10GB.bin" "https://hel1-speed.hetzner.com/10GB.bin" "https://ash-speed.hetzner.com/10GB.bin" "https://speedtest.tele2.net/10GB.zip" "https://scaleway.testdebit.info/10G.bin" "https://bouygues.testdebit.info/10G.bin")
-    echo "${u[$((RANDOM % ${#u[@]}))]}?r=$RANDOM"
+    local use_real=0
+    if [ $(( RANDOM % 100 )) -lt "${REAL_SOURCE_MIX_PCT:-60}" ]; then use_real=1; fi
+
+    if [ "$use_real" -eq 1 ]; then
+        local r=(
+            "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.14.tar.xz"
+            "https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.gz"
+            "https://dl.google.com/go/go1.21.6.linux-amd64.tar.gz"
+            "https://github.com/git/git/archive/refs/tags/v2.43.0.tar.gz"
+            "https://nodejs.org/dist/v20.11.0/node-v20.11.0.tar.gz"
+            "https://releases.ubuntu.com/22.04.3/ubuntu-22.04.3-desktop-amd64.iso"
+            "https://mirrors.edge.kernel.org/archlinux/iso/latest/archlinux-x86_64.iso"
+        )
+        echo "${r[$((RANDOM % ${#r[@]}))]}"
+    else
+        local u=("https://nbg1-speed.hetzner.com/10GB.bin" "https://fsn1-speed.hetzner.com/10GB.bin" "https://hel1-speed.hetzner.com/10GB.bin" "https://ash-speed.hetzner.com/10GB.bin" "https://speedtest.tele2.net/10GB.zip" "https://scaleway.testdebit.info/10G.bin" "https://bouygues.testdebit.info/10G.bin")
+        echo "${u[$((RANDOM % ${#u[@]}))]}?r=$RANDOM"
+    fi
 }
 
 get_up_url() {
@@ -292,15 +330,23 @@ run_traffic() {
     IS_SILENT=0; [[ "$mode" == "CRON" || "$mode" == "HOURLY" || "$mode" == "BG" || "$mode" == "RANDOM" ]] && IS_SILENT=1
 
     local disk_kb=$(df -P "$SCRIPT_DIR" | awk 'NR==2 {print $4}')
-    [ "${disk_kb:-0}" -lt 51200 ] && log "${YELLOW}[警告] 磁盘不足${PLAIN}"
+    [ "${disk_kb:-0}" -lt 51200 ] && log "${YELLOW}[警告] 磁盘空间低${PLAIN}"
     
+    local allow_upload=1
     if [ "$direction" == "UPLOAD_ONLY" ] || [ "$ENABLE_UPLOAD" == "1" ]; then
+        if [ "$TODAY_UP_EN" -eq 0 ] && [ "$mode" != "MANUAL" ]; then
+             allow_upload=0
+             if [ "$direction" == "UPLOAD_ONLY" ]; then return; fi
+        fi
+        
         local mem_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
         [ -z "$mem_kb" ] && mem_kb=$(awk '/MemFree/ {print $2}' /proc/meminfo)
         if [ "${mem_kb:-0}" -lt "$MEM_PROTECT_KB" ]; then
-             [ "$direction" == "UPLOAD_ONLY" ] && log "${YELLOW}[跳过] 内存低${PLAIN}" && return
-             ENABLE_UPLOAD=0
+             [ "$direction" == "UPLOAD_ONLY" ] && log "${YELLOW}[跳过] 内存过低${PLAIN}" && return
+             allow_upload=0
         fi
+    else
+        allow_upload=0
     fi
 
     local input_speed_kb=$(mb_to_kb "${input_limit_speed:-1}")
@@ -336,12 +382,12 @@ run_traffic() {
     [ "${calc_dl_kb:-0}" -lt 512 ] && calc_dl_kb=512
     [ "${calc_ul_kb:-0}" -lt 512 ] && calc_ul_kb=512
 
-    if [ "$direction" == "UPLOAD_ONLY" ] || [ "$ENABLE_UPLOAD" == "1" ]; then prepare_upload_data; fi
+    if [ "$allow_upload" -eq 1 ]; then prepare_upload_data; fi
     
     local speed_log=""
-    if [ "$direction" == "DOWNLOAD_ONLY" ]; then speed_log="DL:$(kb_to_mb $calc_dl_kb)MB/s"
-    elif [ "$direction" == "UPLOAD_ONLY" ]; then speed_log="UL:$(kb_to_mb $calc_ul_kb)MB/s"
-    else speed_log="DL:$(kb_to_mb $calc_dl_kb) | UL:$(kb_to_mb $calc_ul_kb) MB/s"; fi
+    if [ "$direction" == "DOWNLOAD_ONLY" ] || [ "$allow_upload" -eq 0 ]; then speed_log="下载:$(kb_to_mb $calc_dl_kb)MB/s"
+    elif [ "$direction" == "UPLOAD_ONLY" ]; then speed_log="上传:$(kb_to_mb $calc_ul_kb)MB/s"
+    else speed_log="下:$(kb_to_mb $calc_dl_kb) | 上:$(kb_to_mb $calc_ul_kb) MB/s"; fi
     
     log "任务[$mode] 方向:$direction 速率:$speed_log 目标:${val}MB"
     
@@ -358,7 +404,7 @@ run_traffic() {
             PID_DL=$!
         fi
 
-        if [ "$direction" != "DOWNLOAD_ONLY" ]; then
+        if [ "$direction" != "DOWNLOAD_ONLY" ] && [ "$allow_upload" -eq 1 ]; then
             if [ "${calc_ul_kb:-0}" -gt 10 ]; then
                 (
                     PARENT_PID=$$; ulimit -v 32768
@@ -383,7 +429,6 @@ run_traffic() {
             local elapsed=$(( $(now_sec) - start_ts ))
             tick_dl=0; tick_up=0
             
-            # 精确统计：进程存在才计入
             if [ -n "$PID_DL" ] && kill -0 $PID_DL 2>/dev/null; then tick_dl=$calc_dl_kb; fi
             if [ -n "$PID_UP" ] && kill -0 $PID_UP 2>/dev/null; then tick_up=$calc_ul_kb; fi
             
@@ -403,7 +448,7 @@ run_traffic() {
             [ "$pct" -gt 100 ] && pct=100
             
             if [ "$IS_SILENT" == "0" ]; then 
-                echo -ne "\r[运行] 进度:${pct}% | 总量:$(kb_to_mb $current_kb)MB | DL:~$(kb_to_mb $tick_dl)MB/s UL:~$(kb_to_mb $tick_up)MB/s "
+                echo -ne "\r[运行] 进度:${pct}% | 总量:$(kb_to_mb $current_kb)MB | 下:~$(kb_to_mb $tick_dl)MB/s 上:~$(kb_to_mb $tick_up)MB/s "
             fi
             
             if [ "$done" -eq 1 ]; then
@@ -416,7 +461,8 @@ run_traffic() {
         [ -n "$PID_DL" ] && kill $PID_DL 2>/dev/null
         [ -n "$PID_UP" ] && kill $PID_UP 2>/dev/null
         wait $PID_DL $PID_UP 2>/dev/null
-        if [ "$IS_SILENT" == "1" ]; then sleep $(( RANDOM % 5 + 1 )); fi
+        
+        if [ "$IS_SILENT" == "1" ]; then sleep $(( RANDOM % 20 + 10 )); fi
     done
     
     local dur=$(( $(now_sec) - start_ts ))
@@ -444,7 +490,7 @@ install_cron() {
     fi
     if [ "$RANDOM_MODE_ENABLE" == "1" ]; then echo "*/10 * * * * $SCRIPT_PATH --random $CRON_MARK" >> "$tmp"; fi
     crontab "$tmp" && rm -f "$tmp"
-    echo -e "${GREEN}Cron 更新成功!${PLAIN} 保底任务: 北京时间 $BJ_CRON_HOUR:$BJ_CRON_MIN"
+    echo -e "${GREEN}Cron 计划任务已更新!${PLAIN} 保底时间: 北京 $BJ_CRON_HOUR:$BJ_CRON_MIN"
 }
 
 uninstall_all() {
@@ -465,7 +511,13 @@ entry_cron() {
     exec 9>"$LOCK_DAILY"; flock -n 9 || exit 0
     load_config; refresh_day_check
     if ! check_global_fuse; then exit 0; fi
-    log "[Cron] 触发保底任务检查"
+    
+    if [ "${TODAY_SKIP:-0}" -eq 1 ]; then
+        log "[Cron] 今日懒惰模式生效，跳过。"
+        exit 0
+    fi
+
+    log "[Cron] 周期检查开始"
     
     local start_ts=$($DATE_CMD -u -d "$PERIOD_START_DATE 00:00:00" +%s 2>/dev/null)
     if [ -z "$start_ts" ]; then start_ts=$($DATE_CMD -d "$PERIOD_START_DATE" +%s 2>/dev/null); fi
@@ -501,13 +553,13 @@ entry_cron() {
             todo_kb=$(( todo_kb - chunk_kb ))
             
             if [ "$todo_kb" -gt 0 ]; then
-                local slp=$(( RANDOM % 30 + 10 ))
+                local slp=$(( RANDOM % 120 + 30 ))
                 sleep "$slp"
             fi
         done
         mark_today_done
     else
-        log "[Cron] 达标，跳过。"
+        log "[Cron] 目标已达标。"
     fi
 }
 
@@ -518,6 +570,7 @@ entry_hourly() {
     load_config; refresh_day_check
     if ! check_global_fuse; then exit 0; fi
     if [ "$TODAY_DONE" -eq 1 ]; then exit 0; fi
+    if [ "${TODAY_SKIP:-0}" -eq 1 ]; then exit 0; fi
     if [ "$ENABLE_HOURLY" != "1" ]; then exit 0; fi
     local bj_h=$(get_bj_hour)
     if [ "$bj_h" -ge "$HOURLY_BJ_START" ] && [ "$bj_h" -le "$HOURLY_BJ_END" ]; then
@@ -527,7 +580,7 @@ entry_hourly() {
 
 entry_random() {
     check_env; reseed_random
-    local delay=$(( RANDOM % 120 + 1 ))
+    local delay=$(( RANDOM % 180 + 10 ))
     sleep "$delay"
     
     exec 7>"$LOCK_RANDOM"; flock -n 7 || exit 0
@@ -536,16 +589,19 @@ entry_random() {
     if [ "$RANDOM_MODE_ENABLE" != "1" ]; then exit 0; fi
     if [ "$TODAY_DONE" -eq 1 ]; then exit 0; fi
     
+    if [ "${TODAY_SKIP:-0}" -eq 1 ]; then 
+        log "[Random] 今日偷懒，跳过。"
+        exit 0
+    fi
+    
     local bj_h=$(get_bj_hour)
     if [ "$bj_h" -lt "$R_BJ_START" ] || [ "$bj_h" -gt "$R_BJ_END" ]; then exit 0; fi
     
-    # 智能配速 (Smart Pacing)
     local duration=$(( R_BJ_END - R_BJ_START ))
     [ "$duration" -le 0 ] && duration=12
     local elapsed=$(( bj_h - R_BJ_START ))
     local time_pct=$(( elapsed * 100 / duration ))
     
-    # 计算当前流量进度
     local dl_target=${R_TARGET_DL:-1}
     local dl_usage=${R_TODAY_DL:-0}
     local data_pct=$(( dl_usage * 100 / dl_target ))
@@ -553,11 +609,11 @@ entry_random() {
     local dynamic_skip=$R_SKIP_PCT
     
     if [ "$data_pct" -gt "$(( time_pct + 15 ))" ]; then
-        dynamic_skip=85 # 跑太快，强行减速
-        log "[Smart] 进度偏快(${data_pct}% > ${time_pct}%)，主动避让"
+        dynamic_skip=85
+        log "[Smart] 进度过快(${data_pct}% > ${time_pct}%)，主动避让"
     elif [ "$data_pct" -lt "$(( time_pct - 10 ))" ]; then
-        dynamic_skip=10 # 跑太慢，积极补课
-        log "[Smart] 进度偏慢(${data_pct}% < ${time_pct}%)，积极补课"
+        dynamic_skip=10
+        log "[Smart] 进度落后(${data_pct}% < ${time_pct}%)，积极补课"
     fi
     
     if [ $(( RANDOM % 100 )) -lt "$dynamic_skip" ]; then 
@@ -602,21 +658,21 @@ menu() {
     while true; do
         clear
         load_config
-        echo -e "${BLUE}=== VPS Traffic Spirit v4.8.0 ===${PLAIN}"
-        echo -e "${RED}[安全] 每日硬顶: ${GLOBAL_MAX_DAILY_GB} GB${PLAIN}"
-        echo -e "${BOLD}[A] 周期保底${PLAIN}"
+        echo -e "${BLUE}=== VPS Traffic Spirit v2.1.0 (隐身版) ===${PLAIN}"
+        echo -e "${RED}[安全] 每日硬顶: ${GLOBAL_MAX_DAILY_GB} GB | 偷懒率: ${LAZY_CHANCE_PCT}% | 真实源混合: ${REAL_SOURCE_MIX_PCT}%${PLAIN}"
+        echo -e "${BOLD}[A] 周期保底模式${PLAIN}"
         echo -e " 1. 周期: ${GREEN}$PERIOD_DAYS${PLAIN}天 / ${GREEN}$PERIOD_TARGET_GB${PLAIN}GB"
         echo -e " 2. 时间: 北京 ${GREEN}$BJ_CRON_HOUR:$BJ_CRON_MIN${PLAIN}"
-        echo -e "${BOLD}[B] 真实模拟 (今日DL:${R_TARGET_DL} / UP:${R_TARGET_UP} MB)${PLAIN}"
-        echo -e " 3. 开关: $( [ $RANDOM_MODE_ENABLE -eq 1 ] && echo "${RED}ON${PLAIN}" || echo "OFF" )"
+        echo -e "${BOLD}[B] 真实模拟模式 (今日DL:${R_TARGET_DL} / UP:${R_TARGET_UP} MB)${PLAIN}"
+        echo -e " 3. 开关: $( [ $RANDOM_MODE_ENABLE -eq 1 ] && echo "${RED}开启${PLAIN}" || echo "关闭" )"
         echo -e " 4. 基准: 下 ${GREEN}$R_BASE_DAILY_DL_MB${PLAIN} / 上 ${GREEN}$R_BASE_DAILY_UP_MB${PLAIN} MB (浮动${R_DAILY_FLOAT_PCT}%)"
         echo -e " 5. 行为: 北京 ${GREEN}$R_BJ_START-${R_BJ_END}点${PLAIN} | 跳过${GREEN}$R_SKIP_PCT${PLAIN}% | 切片${GREEN}$R_SINGLE_MAX_MB${PLAIN}MB"
         echo -e " 6. 速率: 下 ${GREEN}$R_DL_SPEED_MB${PLAIN} / 上 ${GREEN}$R_UP_SPEED_MB${PLAIN} MB/s"
-        echo -e "${BOLD}[C] 系统${PLAIN}"
-        echo -e " 7. 设置: 全局限额 | 浮动 | 内存保护"
+        echo -e "${BOLD}[C] 系统设置${PLAIN}"
+        echo -e " 7. 参数: 全局限额 | 偷懒率% | 上传日概率% | 混合源%"
         echo -e "----------------------------------------------"
-        echo -e " S. 保存 | 0. 退出"
-        read -p "选项: " c
+        echo -e " S. 保存配置 | 0. 退出"
+        read -p "请选择: " c
         case "$c" in
             1) read -p "天数: " d; [ -n "$d" ] && PERIOD_DAYS=$d; read -p "GB: " g; [ -n "$g" ] && PERIOD_TARGET_GB=$g ;;
             2) read -p "时(0-23): " h; [ -n "$h" ] && BJ_CRON_HOUR=$h; read -p "分: " m; [ -n "$m" ] && BJ_CRON_MIN=$m ;;
@@ -627,7 +683,10 @@ menu() {
                read -p "跳过率%: " p; [ -n "$p" ] && R_SKIP_PCT=$p
                read -p "切片Max(MB): " m; [ -n "$m" ] && R_SINGLE_MAX_MB=$m; read -p "切片浮动%: " f; [ -n "$f" ] && R_SINGLE_FLOAT_PCT=$f ;;
             6) read -p "下载速: " d; [ -n "$d" ] && R_DL_SPEED_MB=$d; read -p "上传速: " u; [ -n "$u" ] && R_UP_SPEED_MB=$u ;;
-            7) read -p "全局硬顶(GB): " g; [ -n "$g" ] && GLOBAL_MAX_DAILY_GB=$g; read -p "系统浮动%: " j; [ -n "$j" ] && JITTER_PERCENT=$j ;;
+            7) read -p "全局硬顶(GB): " g; [ -n "$g" ] && GLOBAL_MAX_DAILY_GB=$g
+               read -p "偷懒概率%: " l; [ -n "$l" ] && LAZY_CHANCE_PCT=$l
+               read -p "上传日概率%: " ud; [ -n "$ud" ] && UPLOAD_DAY_CHANCE_PCT=$ud
+               read -p "真实源混合%: " mx; [ -n "$mx" ] && REAL_SOURCE_MIX_PCT=$mx ;;
             s|S) save_config; install_cron; echo -e "${GREEN}保存成功!${PLAIN}"; sleep 1 ;;
             0) break ;;
         esac
@@ -640,16 +699,17 @@ dashboard() {
     clear
     load_config
     local bg_s="${RED}无${PLAIN}"
-    [ -f "$BG_PID_FILE" ] && kill -0 $(cat "$BG_PID_FILE") 2>/dev/null && bg_s="${GREEN}运行${PLAIN}"
+    [ -f "$BG_PID_FILE" ] && kill -0 $(cat "$BG_PID_FILE") 2>/dev/null && bg_s="${GREEN}运行中${PLAIN}"
     echo -e "${BLUE}=== VPS Traffic Spirit v1.0.0 ===${PLAIN}"
     echo -e " [保底] $(kb_to_gb $PERIOD_KB)/$PERIOD_TARGET_GB GB | 缺口: $(calc_smart_target) MB"
-    echo -e " [模拟] $( [ $RANDOM_MODE_ENABLE -eq 1 ] && echo "${RED}ON${PLAIN}" || echo "OFF" ) | 今日: DL $(kb_to_mb $R_TODAY_DL) / UP $(kb_to_mb $R_TODAY_UP) MB"
-    echo -e " [状态] 后台: $bg_s | 北京时间: $(get_bj_time_str)"
+    echo -e " [模拟] $( [ $RANDOM_MODE_ENABLE -eq 1 ] && echo "${RED}开启${PLAIN}" || echo "关闭" ) | 今日: 下 $(kb_to_mb $R_TODAY_DL) / 上 $(kb_to_mb $R_TODAY_UP) MB"
+    echo -e " [状态] 偷懒日: $([ "${TODAY_SKIP:-0}" -eq 1 ] && echo "${YELLOW}是${PLAIN}" || echo "否") | 允许上传: $([ "${TODAY_UP_EN:-1}" -eq 1 ] && echo "是" || echo "${RED}否${PLAIN}")"
+    echo -e " [系统] 后台: $bg_s | 北京时间: $(get_bj_time_str)"
     echo -e "----------------------------------------------"
-    echo -e " 1. 手动/测速"
-    echo -e " 2. 菜单"
-    echo -e " 3. 日志"
-    echo -e " 4. 卸载"
+    echo -e " 1. 手动测速/运行"
+    echo -e " 2. 设置菜单"
+    echo -e " 3. 查看日志"
+    echo -e " 4. 卸载脚本"
     echo -e " 0. 退出"
     echo -n " 选择: "
 }
@@ -665,16 +725,16 @@ case "$1" in
             read opt
             case "$opt" in
                 1) 
-                    echo -e "\n1.下载测速 2.前台跑 3.后台跑 4.纯上传"
-                    read -p "选: " s
+                    echo -e "\n1.下载测速 2.前台跑 3.后台跑 4.纯上传模式"
+                    read -p "选项: " s
                     case "$s" in
-                        1) echo "Testing..."; s=$(curl -s -w "%{speed_download}" -o /dev/null --max-time 10 "https://nbg1-speed.hetzner.com/10GB.bin"); echo "Speed: $(awk "BEGIN {printf \"%.2f\", $s/1048576}") MB/s"; read -p "..." ;;
-                        2) read -p "MB: " d; read -p "MB/s: " sp; run_traffic "MANUAL" "DATA" "$d" "$sp" "MIX" ;;
-                        3) read -p "MB: " d; read -p "MB/s: " sp; nohup "$SCRIPT_PATH" --bg-run "$d" "$sp" >/dev/null 2>&1 & echo $! > "$BG_PID_FILE"; read -p "Started..." ;;
-                        4) read -p "MB: " d; read -p "MB/s: " sp; run_traffic "MANUAL" "DATA" "$d" "$sp" "UPLOAD_ONLY" ;;
+                        1) echo "Testing..."; s=$(curl -s -w "%{speed_download}" -o /dev/null --max-time 10 "https://nbg1-speed.hetzner.com/10GB.bin"); echo "Speed: $(awk "BEGIN {printf \"%.2f\", $s/1048576}") MB/s"; read -p "按回车继续..." ;;
+                        2) read -p "流量(MB): " d; read -p "速率(MB/s): " sp; run_traffic "MANUAL" "DATA" "$d" "$sp" "MIX" ;;
+                        3) read -p "流量(MB): " d; read -p "速率(MB/s): " sp; nohup "$SCRIPT_PATH" --bg-run "$d" "$sp" >/dev/null 2>&1 & echo $! > "$BG_PID_FILE"; read -p "后台已启动..." ;;
+                        4) read -p "流量(MB): " d; read -p "速率(MB/s): " sp; run_traffic "MANUAL" "DATA" "$d" "$sp" "UPLOAD_ONLY" ;;
                     esac ;;
                 2) menu ;;
-                3) tail -n 10 "$LOG_DIR/system.log"; read -p "..." ;;
+                3) tail -n 10 "$LOG_DIR/system.log"; read -p "按回车继续..." ;;
                 4) uninstall_all ;;
                 0) exit 0 ;;
             esac
