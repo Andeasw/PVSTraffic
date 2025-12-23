@@ -32,22 +32,22 @@ mkdir -p "$LOG_DIR"
 PERIOD_DAYS=7
 PERIOD_TARGET_GB=9
 PERIOD_START_DATE="" 
-DAILY_TARGET_MB=1222
-DAILY_TIME_MIN=90
+DAILY_TARGET_MB=1111
+DAILY_TIME_MIN=85
 CRON_MAX_SPEED_MB=8
 BJ_CRON_HOUR=3
-BJ_CRON_MIN=30
+BJ_CRON_MIN=35
 
 GLOBAL_MAX_DAILY_GB=5
 
 RANDOM_MODE_ENABLE=0
-R_BASE_DAILY_DL_MB=1166
-R_BASE_DAILY_UP_MB=20
+R_BASE_DAILY_DL_MB=1266
+R_BASE_DAILY_UP_MB=25
 R_DL_SPEED_MB=6
 R_UP_SPEED_MB=2
 R_BJ_START=7
-R_BJ_END=17
-R_SINGLE_MAX_MB=268
+R_BJ_END=18
+R_SINGLE_MAX_MB=266
 R_SKIP_PCT=35
 R_DAILY_FLOAT_PCT=15
 R_SINGLE_FLOAT_PCT=30
@@ -101,17 +101,19 @@ reseed_random() {
     RANDOM=$seed
 }
 
-# 真实 UA 模拟池
 get_random_ua() {
-    local uas=(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1"
-        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
-    )
-    echo "${uas[$((RANDOM % ${#uas[@]}))]}"
+    local v_chrome=$((RANDOM % 10 + 121))
+    local v_edge=$((RANDOM % 10 + 120))
+    local v_safari=$((RANDOM % 5 + 15))
+    local platform=$((RANDOM % 5))
+    
+    case $platform in
+        0) echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${v_chrome}.0.0.0 Safari/537.36" ;;
+        1) echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${v_chrome}.0.0.0 Safari/537.36 Edg/${v_edge}.0.0.0" ;;
+        2) echo "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/${v_safari}.2 Safari/605.1.15" ;;
+        3) echo "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1" ;;
+        4) echo "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${v_chrome}.0.0.0 Mobile Safari/537.36" ;;
+    esac
 }
 
 mb_to_kb() { awk "BEGIN{printf \"%.0f\", $1 * 1024}"; }
@@ -278,7 +280,7 @@ get_dl_url() {
 }
 
 get_up_url() {
-    local u=("http://speedtest.tele2.net/upload.php" "http://ipv4.speedtest.tele2.net/upload.php" "http://bouygues.testdebit.info/ul/upload.php" "http://test.kabeldeutschland.de/upload.php")
+    local u=("http://speedtest.tele2.net/upload.php" "http://ipv4.speedtest.tele2.net/upload.php" "http://bouygues.testdebit.info/ul/upload.php" "http://test.kabeldeutschland.de/upload.php" "http://proof.ovh.net/files/" "http://scaleway.testdebit.info/ul/upload.php")
     echo "${u[$((RANDOM % ${#u[@]}))]}"
 }
 
@@ -365,7 +367,13 @@ run_traffic() {
                 (
                     PARENT_PID=$$; ulimit -v 32768
                     while kill -0 "$PARENT_PID" 2>/dev/null; do
-                        nice -n 15 curl -4 -sL -A "$ua" --max-time 60 --connect-timeout 10 --limit-rate "${calc_ul_kb}k" --data-binary "@$TEMP_DATA_FILE" "$up_url" --output /dev/null 2>/dev/null
+                        nice -n 15 curl -4 -sL -A "$ua" \
+                             -H "Content-Type: application/octet-stream" \
+                             -H "Expect:" \
+                             --max-time 60 --connect-timeout 10 \
+                             --limit-rate "${calc_ul_kb}k" \
+                             --data-binary "@$TEMP_DATA_FILE" \
+                             "$up_url" --output /dev/null 2>/dev/null
                         sleep 0.2
                     done
                 ) &
@@ -575,7 +583,7 @@ menu() {
     while true; do
         clear
         load_config
-        echo -e "${BLUE}=== VPS Traffic Spirit v1.0.0 ===${PLAIN}"
+        echo -e "${BLUE}=== VPS Traffic Spirit v4.5.0 ===${PLAIN}"
         echo -e "${RED}[安全] 每日硬顶: ${GLOBAL_MAX_DAILY_GB} GB${PLAIN}"
         echo -e "${BOLD}[A] 周期保底${PLAIN}"
         echo -e " 1. 周期: ${GREEN}$PERIOD_DAYS${PLAIN}天 / ${GREEN}$PERIOD_TARGET_GB${PLAIN}GB"
@@ -614,7 +622,7 @@ dashboard() {
     load_config
     local bg_s="${RED}无${PLAIN}"
     [ -f "$BG_PID_FILE" ] && kill -0 $(cat "$BG_PID_FILE") 2>/dev/null && bg_s="${GREEN}运行${PLAIN}"
-    echo -e "${BLUE}=== VPS Traffic Spirit v4.3.0 ===${PLAIN}"
+    echo -e "${BLUE}=== VPS Traffic Spirit v1.0.0 ===${PLAIN}"
     echo -e " [保底] $(kb_to_gb $PERIOD_KB)/$PERIOD_TARGET_GB GB | 缺口: $(calc_smart_target) MB"
     echo -e " [模拟] $( [ $RANDOM_MODE_ENABLE -eq 1 ] && echo "${RED}ON${PLAIN}" || echo "OFF" ) | 今日: DL $(kb_to_mb $R_TODAY_DL) / UP $(kb_to_mb $R_TODAY_UP) MB"
     echo -e " [状态] 后台: $bg_s | 北京时间: $(get_bj_time_str)"
