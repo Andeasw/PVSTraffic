@@ -669,7 +669,7 @@ dashboard() {
     local bg_s="${RED}无${PLAIN}"
     [ -f "$BG_PID_FILE" ] && kill -0 $(cat "$BG_PID_FILE") 2>/dev/null && bg_s="${GREEN}运行${PLAIN}"
     local smart=$(calc_smart_target)
-    echo -e "${BLUE}=== VPS Traffic Spirit v4.1.0 ===${PLAIN}"
+    echo -e "${BLUE}=== VPS Traffic Spirit v1.0.0 ===${PLAIN}"
     echo -e " [保底] $(kb_to_gb $PERIOD_KB)/$PERIOD_TARGET_GB GB | 缺口: $smart MB"
     echo -e " [模拟] $( [ $RANDOM_MODE_ENABLE -eq 1 ] && echo "${RED}ON${PLAIN}" || echo "OFF" ) | 今日: DL $(kb_to_mb $R_TODAY_DL) / UP $(kb_to_mb $R_TODAY_UP) MB"
     echo -e " [状态] 后台: $bg_s | 北京时间: $(get_bj_time_str)"
