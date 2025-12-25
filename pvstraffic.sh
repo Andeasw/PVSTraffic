@@ -18,8 +18,6 @@ STATS_FILE="$BASE_DIR/history.db"
 TEMP_METRIC="/tmp/ts_metric_$$_${RANDOM}.tmp"
 
 DATE_BIN="date"
-DATE_STATUS="未知"
-UPLOAD_ENABLE=1
 
 readonly URL_DL_POOL=(
     "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.14.tar.xz"
@@ -48,47 +46,53 @@ readonly UA_POOL=(
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
 )
 
-check_env_passive() {
+check_basic_env() {
     mkdir -p "$BASE_DIR" "$LOG_DIR"
     
-    if [ -f "/usr/bin/date" ]; then
-        DATE_BIN="/usr/bin/date"
-        DATE_STATUS="GNU (正常)"
+    if [ -f "/usr/bin/date" ]; then DATE_BIN="/usr/bin/date"
     elif command -v date >/dev/null 2>&1; then
-        if date -d "now" >/dev/null 2>&1; then
-            DATE_BIN="date"
-            DATE_STATUS="System (支持)"
-        else
-            DATE_BIN="date"
-            DATE_STATUS="BusyBox (需修复)"
-        fi
-    else
-        DATE_STATUS="缺失 (严重)"
-    fi
-
-    if [ ! -f "$PAYLOAD_FILE" ]; then
-        if command -v fallocate >/dev/null 2>&1; then
-            fallocate -l 10M "$PAYLOAD_FILE" >/dev/null 2>&1
-        elif command -v dd >/dev/null 2>&1; then
-            dd if=/dev/urandom of="$PAYLOAD_FILE" bs=1M count=10 status=none >/dev/null 2>&1
+        if ! date -d "now" >/dev/null 2>&1; then
+            echo "警告: 系统 date 不兼容 (BusyBox)。请手动安装 coreutils。"
         fi
     fi
-    [ -f "$PAYLOAD_FILE" ] && UPLOAD_ENABLE=1 || UPLOAD_ENABLE=0
     find "$LOG_DIR" -name "traffic_cycle_*.log" -type f -mtime +14 -delete
 }
 
-install_deps() {
-    echo "正在检查并安装依赖 (需要网络)..."
-    if [ -f /etc/alpine-release ]; then
-        apk update && apk add --no-cache curl coreutils procps grep util-linux findutils cronie bash
-        rc-service crond start 2>/dev/null || systemctl start crond 2>/dev/null
-    elif [ -f /etc/debian_version ]; then
-        apt-get update -qq && apt-get install -y -qq curl coreutils procps util-linux findutils cron
-    elif [ -f /etc/redhat-release ]; then
-        yum install -y -q curl coreutils procps util-linux findutils cronie
+check_system_health() {
+    # 保护机制：检查负载和内存
+    local load=$(cat /proc/loadavg | awk '{print $1}')
+    local is_overload=$(awk -v l="$load" 'BEGIN {if (l > 4.0) print 1; else print 0}')
+    
+    if [ "$is_overload" -eq 1 ]; then
+        echo "High Load"
+        return 1
     fi
-    echo "依赖安装尝试完成，请重新进入菜单查看状态。"
-    sleep 2
+    return 0
+}
+
+ensure_upload_capability() {
+    # 保护机制：卡顿熔断
+    if ! check_system_health; then
+        rm -f "$PAYLOAD_FILE"
+        return 2
+    fi
+
+    if [ -f "$PAYLOAD_FILE" ]; then return 0; fi
+
+    # 空间检查 (需 > 200MB)
+    local avail_kb=$(df -k "$BASE_DIR" | awk 'NR==2 {print $4}')
+    if [ "$avail_kb" -lt 204800 ]; then
+        return 1
+    fi
+
+    # 创建文件
+    if command -v fallocate >/dev/null 2>&1; then
+        fallocate -l 100M "$PAYLOAD_FILE" >/dev/null 2>&1
+    elif command -v dd >/dev/null 2>&1; then
+        dd if=/dev/urandom of="$PAYLOAD_FILE" bs=1M count=100 status=none >/dev/null 2>&1
+    fi
+
+    if [ -f "$PAYLOAD_FILE" ]; then return 0; else return 1; fi
 }
 
 init_config() {
@@ -150,12 +154,9 @@ get_ts() {
 get_current_cycle_start() {
     local now=$("$DATE_BIN" +%s 2>/dev/null)
     if [ -z "$now" ]; then echo "0"; return; fi
-    
     local today_maint_str="$("$DATE_BIN" +%Y-%m-%d 2>/dev/null) $MAINT_TIME:00"
     local today_maint_ts=$(get_ts "$today_maint_str")
-    
     if [ -z "$today_maint_ts" ]; then echo "0"; return; fi
-
     if [ "$now" -ge "$today_maint_ts" ]; then
         echo "$today_maint_ts"
     else
@@ -176,7 +177,6 @@ log() {
     local logfile="$LOG_DIR/traffic_cycle_$cycle_date.log"
     local now_str=$("$DATE_BIN" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
     [ -z "$now_str" ] && now_str="Time-Error"
-    
     echo "[$now_str] [$level] [$tag] $msg" >> "$logfile"
     if [[ -t 1 ]]; then echo -e "[$level] $msg"; fi
 }
@@ -185,7 +185,6 @@ get_db_stats() {
     local start_ts=$1
     local end_ts=$2
     if [ ! -f "$STATS_FILE" ] || [ "$start_ts" == "0" ]; then echo "0 0 0 0"; return; fi
-    
     awk -v start="$start_ts" -v end="$end_ts" '
     $1 >= start && $1 < end {
         if ($2 == "AUTO_DL") ad += $3;
@@ -198,7 +197,13 @@ get_db_stats() {
 
 run_speedtest() {
     local type="$1"
-    if [ "$type" == "UP" ] && [ "$UPLOAD_ENABLE" -eq 0 ]; then echo "错误: 磁盘不足。"; return; fi
+    if [ "$type" == "UP" ]; then
+        ensure_upload_capability
+        local res=$?
+        if [ "$res" -eq 1 ]; then echo "错误: 空间不足，无法创建测试文件。"; return; fi
+        if [ "$res" -eq 2 ]; then echo "警告: 系统负载过高，强制取消上传。"; return; fi
+    fi
+    
     local start_time=$(date +%s)
     local end_time=$((start_time + 10))
     local total_bytes=0
@@ -230,7 +235,15 @@ run_traffic() {
     local target_mb="$3"
     local max_speed="$4"
     
-    if [ "$direction" == "UP" ] && [ "$UPLOAD_ENABLE" -eq 0 ]; then return; fi
+    if [ "$direction" == "UP" ]; then
+        ensure_upload_capability
+        local res=$?
+        if [ "$res" -ne 0 ]; then
+            log "WARN" "$task_tag" "上传受限 (代码 $res: 1=空间不足, 2=高负载)"
+            return
+        fi
+    fi
+    
     if [ "$task_tag" != "MANUAL" ]; then sleep $((RANDOM % 15 + 1)); fi
     
     local limit_args=()
@@ -248,10 +261,17 @@ run_traffic() {
     
     local start_ts=$(date +%s)
     local cur_bytes=0
-    local retry=0
     
     while [ "$cur_bytes" -lt "$target_bytes" ]; do
         if [ "$task_tag" != "MANUAL" ] && [ $(( $(date +%s) - start_ts )) -gt 1800 ]; then break; fi
+        
+        # 实时熔断检测
+        if ! check_system_health; then
+            log "WARN" "$task_tag" "系统负载过高，中断任务"
+            [ "$direction" == "UP" ] && rm -f "$PAYLOAD_FILE"
+            break
+        fi
+
         local left_bytes=$((target_bytes - cur_bytes))
         if [ "$left_bytes" -le 0 ]; then break; fi
         
@@ -277,11 +297,8 @@ run_traffic() {
         local bytes=$(cat "$TEMP_METRIC" 2>/dev/null || echo 0)
         
         if [ "$bytes" -lt 100 ]; then
-             retry=$((retry + 1))
-             [ "$retry" -ge 10 ] && break
              sleep $((RANDOM % 3 + 1))
         else
-             retry=0
              cur_bytes=$((cur_bytes + bytes))
         fi
         [ "$task_tag" == "MANUAL" ] && echo -ne "\r进度: $((cur_bytes/1024/1024)) MB / ${actual_target_mb} MB"
@@ -292,7 +309,6 @@ run_traffic() {
     local final_mb=$(awk "BEGIN {printf \"%.2f\", $cur_bytes/1024/1024}")
     if [ "$cur_bytes" -gt 1024 ]; then
         log "INFO" "$task_tag" "完成 $direction | $final_mb MB"
-        
         if [ "$task_tag" != "MANUAL" ]; then 
             local record_ts=$(date +%s)
             if [ "$task_tag" == "MAINT" ]; then
@@ -314,7 +330,7 @@ check_round_safe() {
 }
 
 entry_auto() {
-    check_env_passive; init_config
+    check_basic_env; init_config
     exec 9>"$LOCK_FILE"
     if ! flock -n 9; then exit 0; fi
     
@@ -355,7 +371,7 @@ entry_auto() {
 }
 
 entry_maint() {
-    check_env_passive; init_config
+    check_basic_env; init_config
     exec 9>"$LOCK_FILE"
     if ! flock -n 9; then exit 0; fi
     
@@ -378,7 +394,6 @@ entry_maint() {
     
     if [ "$ad_mb" -lt "$limit_dl" ]; then
         local gap=$((TARGET_DL - ad_mb))
-        # 补量目标加入随机浮动，避免每天总数一致
         local rand_gap=$(calc_float "$gap" "$TARGET_FLOAT")
         log "INFO" "MAINT" "补量启动 DL: 缺口$gap -> 计划$rand_gap MB"
         
@@ -411,7 +426,7 @@ entry_maint() {
 }
 
 setup_cron() {
-    check_env_passive
+    check_basic_env
     echo "正在配置 Cron..."
     read -p "检测间隔 (分钟, 默认10): " min
     [ -z "$min" ] && min=10
@@ -437,7 +452,7 @@ setup_cron() {
 
 main_menu() {
     while true; do
-        check_env_passive; init_config
+        check_basic_env; init_config
         local cycle_start=$(get_current_cycle_start)
         local now=$(date +%s)
         local last_cycle_start=$((cycle_start - 86400))
@@ -461,7 +476,7 @@ main_menu() {
         echo " [环境设置]"
         echo " 每日目标: DL $TARGET_DL MB | UP $TARGET_UP MB (浮动 $TARGET_FLOAT%)"
         echo " 运行策略: $ACTIVE_START点-$ACTIVE_END点 | 偷懒率 $SKIP_CHANCE%"
-        echo " 维护结算: 每日 $MAINT_TIME (UTC+8) | 依赖状态: $DATE_STATUS"
+        echo " 维护结算: 每日 $MAINT_TIME (UTC+8)"
         echo "----------------------------------------------------------------"
         echo " [上一轮结算] (周期结束于 $cycle_date_str $MAINT_TIME)"
         echo " DL详情: AUTO $l_auto_dl + MAINT $l_maint_dl = 总 $l_total_dl MB"
@@ -479,7 +494,6 @@ main_menu() {
         echo " 7. 系统 - 更新 Cron"
         echo " 8. 审计 - 查看日志"
         echo " 9. 卸载 - 删除脚本"
-        echo " 10. 环境 - 检查并修复依赖"
         echo " 0. 退出"
         echo "----------------------------------------------------------------"
         read -p "选择: " opt
@@ -493,7 +507,6 @@ main_menu() {
             7) setup_cron ;;
             8) echo ""; tail -n 20 "$LOG_DIR/traffic_cycle_$cycle_date_str.log"; read -p "..." ;;
             9) crontab -l | grep -v "TrafficSpirit" | crontab -; rm -rf "$BASE_DIR"; exit 0 ;;
-            10) install_deps ;;
             0) exit 0 ;;
         esac
     done
@@ -503,5 +516,5 @@ case "$1" in
     --auto) entry_auto ;;
     --maint) entry_maint ;;
     --manual-bg) run_traffic "MANUAL" "$2" "$3" "$4" ;;
-    *) check_env_passive; main_menu ;;
+    *) check_basic_env; main_menu ;;
 esac
