@@ -453,7 +453,7 @@ main_menu() {
         
         clear
         echo "================================================================"
-        echo "                VPS Traffic Spirit By Prince v1.0"
+        echo "              VPS Traffic Spirit By Prince v1.0"
         echo "================================================================"
         echo " [环境设置]"
         echo " 每日目标: DL $TARGET_DL MB | UP $TARGET_UP MB (浮动 $TARGET_FLOAT%)"
