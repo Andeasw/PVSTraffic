@@ -10,11 +10,11 @@ cd "$SCRIPT_DIR" || exit 1
 
 export TZ='Asia/Shanghai'
 BASE_DIR="$SCRIPT_DIR/TrafficSpirit_Data"
+LOG_DIR="$BASE_DIR/logs"
 CONF_FILE="$BASE_DIR/config.ini"
-LOG_FILE="$BASE_DIR/traffic.log"
 LOCK_FILE="$BASE_DIR/run.lock"
 PAYLOAD_FILE="$BASE_DIR/100mb.dat"
-STATS_FILE="$BASE_DIR/auto_24h.bytes"
+STATS_FILE="$BASE_DIR/auto_db.bytes"
 TEMP_METRIC="/tmp/ts_metric_$$.tmp"
 
 readonly URL_DL_POOL=(
@@ -46,23 +46,19 @@ readonly UA_POOL=(
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
 )
 
-log() {
-    local level="$1"
-    local msg="$2"
-    echo "[$(date "+%Y-%m-%d %H:%M:%S")] [$level] $msg" >> "$LOG_FILE"
-    if [[ -t 1 ]]; then echo -e "[$level] $msg"; fi
-}
-
 check_env() {
-    mkdir -p "$BASE_DIR"
+    mkdir -p "$BASE_DIR" "$LOG_DIR"
     local missing=0
-    for cmd in curl date awk grep flock dd readlink; do
+    for cmd in curl date awk grep flock dd readlink find; do
         if ! command -v $cmd >/dev/null 2>&1; then missing=1; break; fi
     done
     if [ "$missing" -eq 1 ]; then
-        [ -f /etc/alpine-release ] && apk add --no-cache curl coreutils procps grep util-linux
-        [ -f /etc/debian_version ] && apt-get update -qq && apt-get install -y -qq curl coreutils procps util-linux
-        [ -f /etc/redhat-release ] && yum install -y -q curl coreutils procps util-linux
+        if [ -f /etc/alpine-release ]; then
+            apk update && apk add --no-cache curl coreutils procps grep util-linux findutils cronie
+            rc-service crond start 2>/dev/null || systemctl start crond 2>/dev/null
+        fi
+        [ -f /etc/debian_version ] && apt-get update -qq && apt-get install -y -qq curl coreutils procps util-linux findutils cron
+        [ -f /etc/redhat-release ] && yum install -y -q curl coreutils procps util-linux findutils cronie
     fi
     if [ ! -f "$PAYLOAD_FILE" ] || [ $(stat -c%s "$PAYLOAD_FILE" 2>/dev/null || echo 0) -ne 104857600 ]; then
         if command -v fallocate >/dev/null 2>&1; then
@@ -71,6 +67,7 @@ check_env() {
             dd if=/dev/urandom of="$PAYLOAD_FILE" bs=1M count=100 status=none
         fi
     fi
+    find "$LOG_DIR" -name "traffic_cycle_*.log" -type f -mtime +14 -delete
 }
 
 init_config() {
@@ -88,6 +85,7 @@ CHUNK_MB=361
 CHUNK_FLOAT=20
 SKIP_CHANCE=20
 MAINT_TIME="03:30"
+CRON_DELAY_MIN=30
 EOF
     fi
     source "$CONF_FILE"
@@ -107,6 +105,7 @@ CHUNK_MB=$CHUNK_MB
 CHUNK_FLOAT=$CHUNK_FLOAT
 SKIP_CHANCE=$SKIP_CHANCE
 MAINT_TIME="$MAINT_TIME"
+CRON_DELAY_MIN=$CRON_DELAY_MIN
 EOF
 }
 
@@ -118,11 +117,36 @@ calc_float() {
     }'
 }
 
-get_valid_stats() {
+get_cycle_start() {
     local now=$(date +%s)
+    local today_maint_str="$(date +%Y-%m-%d) $MAINT_TIME:00"
+    local today_maint_ts=$(date -d "$today_maint_str" +%s)
+    if [ "$now" -ge "$today_maint_ts" ]; then
+        echo "$today_maint_ts"
+    else
+        echo $((today_maint_ts - 86400))
+    fi
+}
+
+get_cycle_date_str() {
+    date -d "@$(get_cycle_start)" "+%F"
+}
+
+log() {
+    local level="$1"
+    local tag="$2"
+    local msg="$3"
+    local cycle_date=$(get_cycle_date_str)
+    local logfile="$LOG_DIR/traffic_cycle_$cycle_date.log"
+    echo "[$(date "+%Y-%m-%d %H:%M:%S")] [$level] [$tag] $msg" >> "$logfile"
+    if [[ -t 1 ]]; then echo -e "[$level] $msg"; fi
+}
+
+get_valid_stats() {
+    local start_ts=$(get_cycle_start)
     if [ ! -f "$STATS_FILE" ]; then echo "0 0"; return; fi
-    awk -v now="$now" '
-    $1 > (now - 86400) {
+    awk -v start="$start_ts" '
+    $1 >= start {
         if ($2 == "DL") dl += $3;
         if ($2 == "UP") up += $3;
     }
@@ -137,20 +161,23 @@ run_speedtest() {
     local total_bytes=0
     
     echo "正在测速 ($type) - 持续 ${duration} 秒..."
+    local tested_urls=""
     while [ $(date +%s) -lt $end_time ]; do
         local ua="${UA_POOL[$((RANDOM % ${#UA_POOL[@]}))]}"
         local cmd=("curl" "-4" "-s" "-k" "-L" "-A" "$ua" "--connect-timeout" "3" "--max-time" "8" "-o" "/dev/null")
+        local url=""
         if [ "$type" == "DL" ]; then
-            local url="${URL_DL_POOL[$((RANDOM % ${#URL_DL_POOL[@]}))]}"
+            url="${URL_DL_POOL[$((RANDOM % ${#URL_DL_POOL[@]}))]}"
             [[ "$url" == *"?"* ]] && url="$url&r=$RANDOM" || url="$url?r=$RANDOM"
             cmd+=("$url" "-w" "%{size_download}")
         else
-            local url="${URL_UP_POOL[$((RANDOM % ${#URL_UP_POOL[@]}))]}"
+            url="${URL_UP_POOL[$((RANDOM % ${#URL_UP_POOL[@]}))]}"
             cmd+=("-F" "file=@$PAYLOAD_FILE" "$url" "-w" "%{size_upload}")
         fi
         "${cmd[@]}" > "$TEMP_METRIC"
         local bytes=$(cat "$TEMP_METRIC" 2>/dev/null || echo 0)
         [ "$bytes" -gt 0 ] && total_bytes=$((total_bytes + bytes))
+        tested_urls="$url, $tested_urls"
     done
     rm -f "$TEMP_METRIC"
     local real_dur=$(( $(date +%s) - start_time ))
@@ -158,6 +185,7 @@ run_speedtest() {
     local mbps=$(awk "BEGIN {printf \"%.2f\", $total_bytes * 8 / $real_dur / 1000 / 1000}")
     local mbs=$(awk "BEGIN {printf \"%.2f\", $total_bytes / $real_dur / 1024 / 1024}")
     echo -e "测速结果: \033[32m$mbps Mbps\033[0m ($mbs MB/s)"
+    log "INFO" "TEST" "测速 $type | $mbps Mbps | 耗时 ${real_dur}s | 节点: $tested_urls"
 }
 
 run_traffic() {
@@ -176,30 +204,33 @@ run_traffic() {
     fi
 
     local target_bytes=$(awk "BEGIN {printf \"%.0f\", $target_mb * 1024 * 1024}")
-    log "INFO" "任务启动 [$tag] $type 目标:${target_mb}MB"
+    log "INFO" "$tag" "任务启动 [$type] 目标:${target_mb}MB"
 
     local start_ts=$(date +%s)
     local cur_bytes=0
     local retry=0
+    local last_url=""
     
     while [ "$cur_bytes" -lt "$target_bytes" ]; do
         if [ "$tag" != "MANUAL" ] && [ $(( $(date +%s) - start_ts )) -gt 1800 ]; then
-            log "WARN" "单次运行超时 (30min)，强制停止释放锁"
+            log "WARN" "$tag" "任务超时 (30min) 强制停止"
             break
         fi
 
         local ua="${UA_POOL[$((RANDOM % ${#UA_POOL[@]}))]}"
         local cmd=("curl" "-4" "-s" "-k" "-L" "-A" "$ua" "${limit_args[@]}" "--connect-timeout" "5" "--max-time" "60" "-o" "/dev/null")
+        local url=""
 
         if [ "$type" == "DL" ]; then
-            local url="${URL_DL_POOL[$((RANDOM % ${#URL_DL_POOL[@]}))]}"
+            url="${URL_DL_POOL[$((RANDOM % ${#URL_DL_POOL[@]}))]}"
             [[ "$url" == *"?"* ]] && url="$url&r=$RANDOM" || url="$url?r=$RANDOM"
             cmd+=("$url" "-w" "%{size_download}")
         else
-            local url="${URL_UP_POOL[$((RANDOM % ${#URL_UP_POOL[@]}))]}"
+            url="${URL_UP_POOL[$((RANDOM % ${#URL_UP_POOL[@]}))]}"
             cmd+=("-F" "file=@$PAYLOAD_FILE" "$url" "-w" "%{size_upload}")
         fi
-
+        
+        last_url="$url"
         "${cmd[@]}" > "$TEMP_METRIC"
         local bytes=$(cat "$TEMP_METRIC" 2>/dev/null || echo 0)
         
@@ -218,24 +249,41 @@ run_traffic() {
     
     if [ "$tag" == "MANUAL" ]; then echo ""; fi
     
+    local dur=$(( $(date +%s) - start_ts ))
+    local final_mb=$(awk "BEGIN {printf \"%.2f\", $cur_bytes/1024/1024}")
+    
     if [ "$cur_bytes" -gt 1024 ]; then
-        log "INFO" "完成 $type $(awk "BEGIN {printf \"%.2f\", $cur_bytes/1024/1024}") MB"
+        log "INFO" "$tag" "任务完成 $type | $final_mb MB | 耗时 ${dur}s | 节点: $last_url"
         if [ "$tag" != "MANUAL" ]; then
             echo "$(date +%s) $type $cur_bytes" >> "$STATS_FILE"
         fi
+    else
+        log "ERROR" "$tag" "任务失败 $type | $final_mb MB | 耗时 ${dur}s | 节点: $last_url"
     fi
 }
 
 entry_auto() {
     check_env; init_config
-    exec 9>"$LOCK_FILE"
-    flock -n 9 || exit 0
+    log "INFO" "AUTO" "Cron 唤醒检查"
     
-    sleep $((RANDOM % 300))
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        log "WARN" "AUTO" "进程锁冲突，任务跳过"
+        exit 0
+    fi
+    
+    sleep $((RANDOM % 60))
     
     local h=$(date "+%H" | awk '{print int($0)}')
-    if [ "$h" -lt "$ACTIVE_START" ] || [ "$h" -ge "$ACTIVE_END" ]; then exit 0; fi
-    if [ $((RANDOM % 100)) -lt "$SKIP_CHANCE" ]; then log "INFO" "随机跳过"; exit 0; fi
+    if [ "$h" -lt "$ACTIVE_START" ] || [ "$h" -ge "$ACTIVE_END" ]; then
+        log "INFO" "AUTO" "非活跃时段 ($h点)，任务跳过"
+        exit 0
+    fi
+    
+    if [ $((RANDOM % 100)) -lt "$SKIP_CHANCE" ]; then
+        log "INFO" "AUTO" "偷懒判定命中，任务跳过"
+        exit 0
+    fi
     
     local dyn_dl=$(calc_float "$TARGET_DL" "$TARGET_FLOAT")
     local dyn_up=$(calc_float "$TARGET_UP" "$TARGET_FLOAT")
@@ -244,7 +292,7 @@ entry_auto() {
     local c_dl_mb=$(awk "BEGIN {printf \"%.0f\", $c_dl/1024/1024}")
     local c_up_mb=$(awk "BEGIN {printf \"%.0f\", $c_up/1024/1024}")
     
-    log "INFO" "检查状态: DL:$c_dl_mb/$dyn_dl UP:$c_up_mb/$dyn_up"
+    log "INFO" "AUTO" "状态检查 DL:$c_dl_mb/$dyn_dl UP:$c_up_mb/$dyn_up"
     
     if [ "$c_dl_mb" -lt "$dyn_dl" ]; then
         local chunk=$(calc_float "$CHUNK_MB" "$CHUNK_FLOAT")
@@ -262,18 +310,25 @@ entry_auto() {
         run_traffic "AUTO" "UP" "$chunk" "$MAX_SPEED_UP"
     fi
     
-    if [ $(wc -l < "$STATS_FILE" 2>/dev/null || echo 0) -gt 2000 ]; then
-        local now=$(date +%s)
-        awk -v now="$now" '$1 > (now - 86400) {print $0}' "$STATS_FILE" > "$STATS_FILE.tmp" && mv "$STATS_FILE.tmp" "$STATS_FILE"
+    if [ $(wc -l < "$STATS_FILE" 2>/dev/null || echo 0) -gt 10000 ]; then
+        local cycle_start=$(get_cycle_start)
+        awk -v start="$cycle_start" '$1 >= start {print $0}' "$STATS_FILE" > "$STATS_FILE.tmp" && mv "$STATS_FILE.tmp" "$STATS_FILE"
     fi
 }
 
 entry_maint() {
     check_env; init_config
-    exec 9>"$LOCK_FILE"
-    flock -n 9 || exit 0
+    log "INFO" "MAINT" "维护进程唤醒"
     
-    sleep $((RANDOM % 3540 + 60))
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        log "WARN" "MAINT" "进程锁冲突，任务跳过"
+        exit 0
+    fi
+    
+    local delay=$(( RANDOM % (CRON_DELAY_MIN * 60) ))
+    log "INFO" "MAINT" "随机延迟等待: ${delay}s"
+    sleep $delay
     
     read c_dl c_up <<< $(get_valid_stats)
     local c_dl_mb=$(awk "BEGIN {printf \"%.0f\", $c_dl/1024/1024}")
@@ -281,6 +336,8 @@ entry_maint() {
     
     local t_dl=$(awk "BEGIN {printf \"%.0f\", $TARGET_DL * 0.95}")
     local t_up=$(awk "BEGIN {printf \"%.0f\", $TARGET_UP * 0.95}")
+    
+    log "INFO" "MAINT" "缺口检查 DL:$c_dl_mb/$t_dl UP:$c_up_mb/$t_up"
     
     local gap=$((t_dl - c_dl_mb))
     while [ "$gap" -gt 0 ]; do
@@ -299,19 +356,28 @@ entry_maint() {
         gap=$((gap - chunk))
         sleep 5
     done
+    log "INFO" "MAINT" "维护结束"
 }
 
 setup_cron() {
+    check_env
     echo "正在配置 Cron..."
     read -p "检测间隔 (分钟, 默认10): " min
     [ -z "$min" ] && min=10
     
-    local sys_off=$(unset TZ; date +%z | awk '{h=substr($0,2,2); m=substr($0,4,2); s=h*3600+m*60; if(substr($0,1,1)=="-") s=-s; print s}')
-    local mh=$(echo $MAINT_TIME | cut -d: -f1); local mm=$(echo $MAINT_TIME | cut -d: -f2)
-    local target=$((mh*3600 + mm*60 + sys_off - 28800))
-    while [ "$target" -lt 0 ]; do target=$((target + 86400)); done
-    while [ "$target" -ge 86400 ]; do target=$((target - 86400)); done
-    local ch=$((target / 3600)); local cm=$(( (target % 3600) / 60 ))
+    read cm ch <<< $(awk -v time="$MAINT_TIME" -v offset="$(unset TZ; date +%z)" 'BEGIN {
+        split(time, t, ":");
+        h = t[1]; m = t[2];
+        sign = (substr(offset,1,1)=="-") ? -1 : 1;
+        oh = substr(offset,2,2);
+        om = substr(offset,4,2);
+        sys_off = sign * (oh*3600 + om*60);
+        target_sec = h*3600 + m*60;
+        final = target_sec - 28800 + sys_off;
+        while (final < 0) final += 86400;
+        while (final >= 86400) final -= 86400;
+        printf "%d %d", int((final%3600)/60), int(final/3600);
+    }')
     
     crontab -l 2>/dev/null | grep -v "TrafficSpirit" > /tmp/cron.tmp
     echo "*/$min * * * * /bin/bash $SCRIPT_ABS_PATH --auto >>/dev/null 2>&1 # [TrafficSpirit_Routine]" >> /tmp/cron.tmp
@@ -323,35 +389,47 @@ setup_cron() {
 main_menu() {
     while true; do
         check_env; init_config
+        local cycle_date=$(get_cycle_date_str)
         read c_dl c_up <<< $(get_valid_stats)
         local c_dl_mb=$(awk "BEGIN {printf \"%.1f\", $c_dl/1024/1024}")
         local c_up_mb=$(awk "BEGIN {printf \"%.1f\", $c_up/1024/1024}")
         
         clear
-        echo "VPS Traffic Spirit By Prince"
-        echo "过去24小时: DL $c_dl_mb/$TARGET_DL MB | UP $c_up_mb/$TARGET_UP MB"
-        echo "--------------------------------------------------------"
-        echo " 1. 设置 - 每日目标"
-        echo " 2. 设置 - 速率限制"
-        echo " 3. 设置 - 维护时间/切片/时段"
+        echo "================================================================"
+        echo "              VPS Traffic Spirit By Prince v1.0"
+        echo "================================================================"
+        echo " [环境设置]"
+        echo " 每日目标: DL $TARGET_DL MB | UP $TARGET_UP MB (浮动 $TARGET_FLOAT%)"
+        echo " 速率限制: DL $MAX_SPEED_DL MB/s | UP $MAX_SPEED_UP MB/s (浮动 $SPEED_FLOAT%)"
+        echo " 运行时间: $ACTIVE_START点-$ACTIVE_END点 | 切片 $CHUNK_MB MB (浮动 $CHUNK_FLOAT%)"
+        echo " 维护策略: $MAINT_TIME (UTC+8) | 延迟 0-$CRON_DELAY_MIN 分 | 偷懒率 $SKIP_CHANCE%"
+        echo "----------------------------------------------------------------"
+        echo " [本轮状态: $cycle_date]"
+        echo " 周期定义: 今日 $MAINT_TIME 至 明日 $MAINT_TIME"
+        echo " 已跑流量: DL $c_dl_mb MB | UP $c_up_mb MB"
+        echo " 日志文件: $LOG_DIR/traffic_cycle_$cycle_date.log"
+        echo "================================================================"
+        echo " 1. 设置 - 每日目标 (MB)"
+        echo " 2. 设置 - 速率限制 (MB/s)"
+        echo " 3. 设置 - 维护时间/延迟/偷懒率"
         echo " 4. 运行 - 手动前台"
         echo " 5. 运行 - 手动后台"
         echo " 6. 工具 - 10s 极速测速"
-        echo " 7. 系统 - 更新 Cron (安装)"
-        echo " 8. 审计 - 查看日志"
+        echo " 7. 系统 - 更新 Cron (保存后必点)"
+        echo " 8. 审计 - 查看本轮日志"
         echo " 9. 卸载 - 删除脚本"
         echo " 0. 退出"
-        echo "--------------------------------------------------------"
+        echo "----------------------------------------------------------------"
         read -p "选择: " opt
         case "$opt" in
-            1) read -p "DL MB: " TARGET_DL; read -p "UP MB: " TARGET_UP; save_config ;;
-            2) read -p "DL MB/s: " MAX_SPEED_DL; read -p "UP MB/s: " MAX_SPEED_UP; save_config ;;
-            3) read -p "维护时间: " MAINT_TIME; read -p "起始点: " ACTIVE_START; read -p "结束点: " ACTIVE_END; read -p "切片MB: " CHUNK_MB; save_config ;;
+            1) read -p "下载目标(MB): " TARGET_DL; read -p "上传目标(MB): " TARGET_UP; read -p "目标浮动(%): " TARGET_FLOAT; save_config ;;
+            2) read -p "下载限速(MB/s): " MAX_SPEED_DL; read -p "上传限速(MB/s): " MAX_SPEED_UP; read -p "速率浮动(%): " SPEED_FLOAT; save_config ;;
+            3) read -p "维护启动时间(HH:MM): " MAINT_TIME; read -p "维护随机延迟(0-X分): " CRON_DELAY_MIN; read -p "偷懒概率(%): " SKIP_CHANCE; read -p "活跃起始点(0-23): " ACTIVE_START; read -p "活跃结束点(0-23): " ACTIVE_END; read -p "单次切片(MB): " CHUNK_MB; save_config ;;
             4) read -p "1.DL 2.UP: " d; t="DL"; [ "$d" == "2" ] && t="UP"; read -p "MB: " m; read -p "MB/s: " s; run_traffic "MANUAL" "$t" "$m" "$s"; read -p "..." ;;
             5) read -p "1.DL 2.UP: " d; t="DL"; [ "$d" == "2" ] && t="UP"; read -p "MB: " m; read -p "MB/s: " s; nohup bash "$0" --manual-bg "$t" "$m" "$s" >/dev/null 2>&1 & echo "PID: $!"; sleep 2 ;;
             6) read -p "1.DL 2.UP: " d; t="DL"; [ "$d" == "2" ] && t="UP"; run_speedtest "$t"; read -p "..." ;;
             7) setup_cron ;;
-            8) tail -n 20 "$LOG_FILE"; read -p "..." ;;
+            8) echo ""; tail -n 20 "$LOG_DIR/traffic_cycle_$cycle_date.log"; read -p "..." ;;
             9) crontab -l | grep -v "TrafficSpirit" | crontab -; rm -rf "$BASE_DIR"; exit 0 ;;
             0) exit 0 ;;
         esac
