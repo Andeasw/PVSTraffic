@@ -86,6 +86,7 @@ CHUNK_FLOAT=20
 SKIP_CHANCE=20
 MAINT_TIME="03:30"
 CRON_DELAY_MIN=30
+ROUND_LIMIT_GB=5
 EOF
     fi
     source "$CONF_FILE"
@@ -106,14 +107,17 @@ CHUNK_FLOAT=$CHUNK_FLOAT
 SKIP_CHANCE=$SKIP_CHANCE
 MAINT_TIME="$MAINT_TIME"
 CRON_DELAY_MIN=$CRON_DELAY_MIN
+ROUND_LIMIT_GB=$ROUND_LIMIT_GB
 EOF
 }
 
 calc_float() {
     awk -v base="$1" -v pct="$2" -v seed="$RANDOM" 'BEGIN {
-        srand(seed); range = base * pct / 100;
+        srand(seed); 
+        range = base * pct / 100;
         val = base - range + (2 * range * rand());
-        if (val < 1) val=1; printf "%.0f", val
+        if (val < 1) val=1; 
+        printf "%.0f", val
     }'
 }
 
@@ -194,17 +198,23 @@ run_traffic() {
     local target_mb="$3"
     local max_speed="$4"
     
-    if [ "$tag" != "MANUAL" ]; then sleep $((RANDOM % 30 + 1)); fi
+    if [ "$tag" != "MANUAL" ]; then sleep $((RANDOM % 15 + 1)); fi
     
     local limit_args=()
+    local real_kb=0
+    
     if [ "$max_speed" != "0" ]; then
-        local real_kb=$(calc_float "$((max_speed * 1024))" "$SPEED_FLOAT")
+        real_kb=$(calc_float "$((max_speed * 1024))" "$SPEED_FLOAT")
         [ "$real_kb" -lt 100 ] && real_kb=100
         limit_args=("--limit-rate" "${real_kb}k")
     fi
 
     local target_bytes=$(awk "BEGIN {printf \"%.0f\", $target_mb * 1024 * 1024}")
-    log "INFO" "$tag" "任务启动 [$type] 目标:${target_mb}MB"
+    
+    local spd_desc="无限制"
+    if [ "$max_speed" != "0" ]; then spd_desc="$(awk "BEGIN {printf \"%.2f\", $real_kb/1024}") MB/s"; fi
+    
+    log "INFO" "$tag" "任务启动 [$type] 目标:${target_mb}MB | 随机限速:$spd_desc"
 
     local start_ts=$(date +%s)
     local cur_bytes=0
@@ -213,18 +223,29 @@ run_traffic() {
     
     while [ "$cur_bytes" -lt "$target_bytes" ]; do
         if [ "$tag" != "MANUAL" ] && [ $(( $(date +%s) - start_ts )) -gt 1800 ]; then
-            log "WARN" "$tag" "任务超时 (30min) 强制停止"
+            log "WARN" "$tag" "任务超时强制停止"
             break
         fi
 
+        local left_bytes=$((target_bytes - cur_bytes))
+        if [ "$left_bytes" -le 0 ]; then break; fi
+
         local ua="${UA_POOL[$((RANDOM % ${#UA_POOL[@]}))]}"
-        local cmd=("curl" "-4" "-s" "-k" "-L" "-A" "$ua" "${limit_args[@]}" "--connect-timeout" "5" "--max-time" "60" "-o" "/dev/null")
+        local est_sec=60
+        if [ "$real_kb" -gt 0 ]; then 
+             est_sec=$(( left_bytes / (real_kb * 1024) + 2 ))
+        fi
+        [ "$est_sec" -lt 5 ] && est_sec=5
+        [ "$est_sec" -gt 300 ] && est_sec=300
+
+        local cmd=("curl" "-4" "-s" "-k" "-L" "-A" "$ua" "${limit_args[@]}" "--connect-timeout" "5" "--max-time" "$est_sec" "-o" "/dev/null")
         local url=""
 
         if [ "$type" == "DL" ]; then
             url="${URL_DL_POOL[$((RANDOM % ${#URL_DL_POOL[@]}))]}"
             [[ "$url" == *"?"* ]] && url="$url&r=$RANDOM" || url="$url?r=$RANDOM"
-            cmd+=("$url" "-w" "%{size_download}")
+            local range_end=$((left_bytes - 1))
+            cmd+=("-H" "Range: bytes=0-$range_end" "$url" "-w" "%{size_download}")
         else
             url="${URL_UP_POOL[$((RANDOM % ${#URL_UP_POOL[@]}))]}"
             cmd+=("-F" "file=@$PAYLOAD_FILE" "$url" "-w" "%{size_upload}")
@@ -234,7 +255,7 @@ run_traffic() {
         "${cmd[@]}" > "$TEMP_METRIC"
         local bytes=$(cat "$TEMP_METRIC" 2>/dev/null || echo 0)
         
-        if [ "$bytes" -lt 1024 ]; then
+        if [ "$bytes" -lt 100 ]; then
              retry=$((retry + 1))
              [ "$retry" -ge 10 ] && break
              sleep $((RANDOM % 3 + 1))
@@ -253,22 +274,31 @@ run_traffic() {
     local final_mb=$(awk "BEGIN {printf \"%.2f\", $cur_bytes/1024/1024}")
     
     if [ "$cur_bytes" -gt 1024 ]; then
-        log "INFO" "$tag" "任务完成 $type | $final_mb MB | 耗时 ${dur}s | 节点: $last_url"
+        log "INFO" "$tag" "任务完成 $type | $final_mb MB | 耗时 ${dur}s"
         if [ "$tag" != "MANUAL" ]; then
             echo "$(date +%s) $type $cur_bytes" >> "$STATS_FILE"
         fi
     else
-        log "ERROR" "$tag" "任务失败 $type | $final_mb MB | 耗时 ${dur}s | 节点: $last_url"
+        log "ERROR" "$tag" "任务失败 $type | $final_mb MB | 节点: $last_url"
     fi
+}
+
+check_round_limit() {
+    local current_mb=$1
+    local limit_mb=$((ROUND_LIMIT_GB * 1024))
+    if [ "$current_mb" -ge "$limit_mb" ]; then
+        return 1
+    fi
+    return 0
 }
 
 entry_auto() {
     check_env; init_config
-    log "INFO" "AUTO" "Cron 唤醒检查"
+    log "INFO" "AUTO" "Cron 唤醒"
     
     exec 9>"$LOCK_FILE"
     if ! flock -n 9; then
-        log "WARN" "AUTO" "进程锁冲突，任务跳过"
+        log "WARN" "AUTO" "锁冲突，跳过"
         exit 0
     fi
     
@@ -276,12 +306,12 @@ entry_auto() {
     
     local h=$(date "+%H" | awk '{print int($0)}')
     if [ "$h" -lt "$ACTIVE_START" ] || [ "$h" -ge "$ACTIVE_END" ]; then
-        log "INFO" "AUTO" "非活跃时段 ($h点)，任务跳过"
+        log "INFO" "AUTO" "非活跃时段，跳过"
         exit 0
     fi
     
     if [ $((RANDOM % 100)) -lt "$SKIP_CHANCE" ]; then
-        log "INFO" "AUTO" "偷懒判定命中，任务跳过"
+        log "INFO" "AUTO" "偷懒命中，跳过"
         exit 0
     fi
     
@@ -292,22 +322,37 @@ entry_auto() {
     local c_dl_mb=$(awk "BEGIN {printf \"%.0f\", $c_dl/1024/1024}")
     local c_up_mb=$(awk "BEGIN {printf \"%.0f\", $c_up/1024/1024}")
     
-    log "INFO" "AUTO" "状态检查 DL:$c_dl_mb/$dyn_dl UP:$c_up_mb/$dyn_up"
+    log "INFO" "AUTO" "状态 DL:$c_dl_mb/$dyn_dl UP:$c_up_mb/$dyn_up"
+    
+    local round_total_mb=0
     
     if [ "$c_dl_mb" -lt "$dyn_dl" ]; then
         local chunk=$(calc_float "$CHUNK_MB" "$CHUNK_FLOAT")
         local left=$((dyn_dl - c_dl_mb))
         [ "$chunk" -gt "$left" ] && chunk=$left
         [ "$chunk" -lt 10 ] && chunk=10
-        run_traffic "AUTO" "DL" "$chunk" "$MAX_SPEED_DL"
+        
+        if [ $((round_total_mb + chunk)) -gt $((ROUND_LIMIT_GB * 1024)) ]; then chunk=$((ROUND_LIMIT_GB * 1024 - round_total_mb)); fi
+        
+        if [ "$chunk" -gt 0 ]; then
+             run_traffic "AUTO" "DL" "$chunk" "$MAX_SPEED_DL"
+             round_total_mb=$((round_total_mb + chunk))
+        fi
     fi
     
     if [ $((RANDOM % 100)) -lt 70 ] && [ "$c_up_mb" -lt "$dyn_up" ]; then
-        local chunk=$(calc_float "$((CHUNK_MB/4))" "$CHUNK_FLOAT")
-        local left=$((dyn_up - c_up_mb))
-        [ "$chunk" -gt "$left" ] && chunk=$left
-        [ "$chunk" -lt 5 ] && chunk=5
-        run_traffic "AUTO" "UP" "$chunk" "$MAX_SPEED_UP"
+        if check_round_limit "$round_total_mb"; then
+            local chunk=$(calc_float "$((CHUNK_MB/4))" "$CHUNK_FLOAT")
+            local left=$((dyn_up - c_up_mb))
+            [ "$chunk" -gt "$left" ] && chunk=$left
+            [ "$chunk" -lt 5 ] && chunk=5
+            
+            if [ $((round_total_mb + chunk)) -gt $((ROUND_LIMIT_GB * 1024)) ]; then chunk=$((ROUND_LIMIT_GB * 1024 - round_total_mb)); fi
+            
+            if [ "$chunk" -gt 0 ]; then
+                run_traffic "AUTO" "UP" "$chunk" "$MAX_SPEED_UP"
+            fi
+        fi
     fi
     
     if [ $(wc -l < "$STATS_FILE" 2>/dev/null || echo 0) -gt 10000 ]; then
@@ -318,16 +363,16 @@ entry_auto() {
 
 entry_maint() {
     check_env; init_config
-    log "INFO" "MAINT" "维护进程唤醒"
+    log "INFO" "MAINT" "维护唤醒"
     
     exec 9>"$LOCK_FILE"
     if ! flock -n 9; then
-        log "WARN" "MAINT" "进程锁冲突，任务跳过"
+        log "WARN" "MAINT" "锁冲突，跳过"
         exit 0
     fi
     
     local delay=$(( RANDOM % (CRON_DELAY_MIN * 60) ))
-    log "INFO" "MAINT" "随机延迟等待: ${delay}s"
+    log "INFO" "MAINT" "延迟等待: ${delay}s"
     sleep $delay
     
     read c_dl c_up <<< $(get_valid_stats)
@@ -339,24 +384,36 @@ entry_maint() {
     
     log "INFO" "MAINT" "缺口检查 DL:$c_dl_mb/$t_dl UP:$c_up_mb/$t_up"
     
+    local round_total_mb=0
+    
     local gap=$((t_dl - c_dl_mb))
     while [ "$gap" -gt 0 ]; do
+        if ! check_round_limit "$round_total_mb"; then log "WARN" "MAINT" "触达每轮 ${ROUND_LIMIT_GB}GB 限额，停止"; break; fi
+        
         local chunk=$(calc_float "$CHUNK_MB" "$CHUNK_FLOAT")
         [ "$chunk" -gt "$gap" ] && chunk=$gap
+        
         run_traffic "MAINT" "DL" "$chunk" "$MAX_SPEED_DL"
+        
         gap=$((gap - chunk))
+        round_total_mb=$((round_total_mb + chunk))
         sleep 5
     done
     
     gap=$((t_up - c_up_mb))
     while [ "$gap" -gt 0 ]; do
+        if ! check_round_limit "$round_total_mb"; then break; fi
+        
         local chunk=50
         [ "$chunk" -gt "$gap" ] && chunk=$gap
+        
         run_traffic "MAINT" "UP" "$chunk" "$MAX_SPEED_UP"
+        
         gap=$((gap - chunk))
+        round_total_mb=$((round_total_mb + chunk))
         sleep 5
     done
-    log "INFO" "MAINT" "维护结束"
+    log "INFO" "MAINT" "结束"
 }
 
 setup_cron() {
@@ -396,13 +453,14 @@ main_menu() {
         
         clear
         echo "================================================================"
-        echo "              VPS Traffic Spirit By Prince v1.0"
+        echo "                VPS Traffic Spirit By Prince v1.0"
         echo "================================================================"
         echo " [环境设置]"
         echo " 每日目标: DL $TARGET_DL MB | UP $TARGET_UP MB (浮动 $TARGET_FLOAT%)"
         echo " 速率限制: DL $MAX_SPEED_DL MB/s | UP $MAX_SPEED_UP MB/s (浮动 $SPEED_FLOAT%)"
         echo " 运行时间: $ACTIVE_START点-$ACTIVE_END点 | 切片 $CHUNK_MB MB (浮动 $CHUNK_FLOAT%)"
         echo " 维护策略: $MAINT_TIME (UTC+8) | 延迟 0-$CRON_DELAY_MIN 分 | 偷懒率 $SKIP_CHANCE%"
+        echo " 安全熔断: 每轮任务最大消耗 $ROUND_LIMIT_GB GB"
         echo "----------------------------------------------------------------"
         echo " [本轮状态: $cycle_date]"
         echo " 周期定义: 今日 $MAINT_TIME 至 明日 $MAINT_TIME"
@@ -424,7 +482,7 @@ main_menu() {
         case "$opt" in
             1) read -p "下载目标(MB): " TARGET_DL; read -p "上传目标(MB): " TARGET_UP; read -p "目标浮动(%): " TARGET_FLOAT; save_config ;;
             2) read -p "下载限速(MB/s): " MAX_SPEED_DL; read -p "上传限速(MB/s): " MAX_SPEED_UP; read -p "速率浮动(%): " SPEED_FLOAT; save_config ;;
-            3) read -p "维护启动时间(HH:MM): " MAINT_TIME; read -p "维护随机延迟(0-X分): " CRON_DELAY_MIN; read -p "偷懒概率(%): " SKIP_CHANCE; read -p "活跃起始点(0-23): " ACTIVE_START; read -p "活跃结束点(0-23): " ACTIVE_END; read -p "单次切片(MB): " CHUNK_MB; save_config ;;
+            3) read -p "维护时间: " MAINT_TIME; read -p "随机延迟(分): " CRON_DELAY_MIN; read -p "偷懒率(%): " SKIP_CHANCE; read -p "起始点: " ACTIVE_START; read -p "结束点: " ACTIVE_END; read -p "单次切片(MB): " CHUNK_MB; read -p "每轮限额(GB): " ROUND_LIMIT_GB; save_config ;;
             4) read -p "1.DL 2.UP: " d; t="DL"; [ "$d" == "2" ] && t="UP"; read -p "MB: " m; read -p "MB/s: " s; run_traffic "MANUAL" "$t" "$m" "$s"; read -p "..." ;;
             5) read -p "1.DL 2.UP: " d; t="DL"; [ "$d" == "2" ] && t="UP"; read -p "MB: " m; read -p "MB/s: " s; nohup bash "$0" --manual-bg "$t" "$m" "$s" >/dev/null 2>&1 & echo "PID: $!"; sleep 2 ;;
             6) read -p "1.DL 2.UP: " d; t="DL"; [ "$d" == "2" ] && t="UP"; run_speedtest "$t"; read -p "..." ;;
