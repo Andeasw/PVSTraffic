@@ -13,9 +13,12 @@ BASE_DIR="$SCRIPT_DIR/TrafficSpirit_Data"
 LOG_DIR="$BASE_DIR/logs"
 CONF_FILE="$BASE_DIR/config.ini"
 LOCK_FILE="$BASE_DIR/run.lock"
-PAYLOAD_FILE="$BASE_DIR/100mb.dat"
+PAYLOAD_FILE="$BASE_DIR/payload.dat"
 STATS_FILE="$BASE_DIR/auto_db.bytes"
 TEMP_METRIC="/tmp/ts_metric_$$.tmp"
+
+# 全局标志：上传是否可用 (0=不可用, 1=可用)
+UPLOAD_ENABLE=1
 
 readonly URL_DL_POOL=(
     "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.14.tar.xz"
@@ -48,25 +51,54 @@ readonly UA_POOL=(
 
 check_env() {
     mkdir -p "$BASE_DIR" "$LOG_DIR"
+    
+    # 1. 基础依赖检查与安装
     local missing=0
     for cmd in curl date awk grep flock dd readlink find; do
         if ! command -v $cmd >/dev/null 2>&1; then missing=1; break; fi
     done
+    
     if [ "$missing" -eq 1 ]; then
+        echo "正在安装缺失依赖..."
         if [ -f /etc/alpine-release ]; then
-            apk update && apk add --no-cache curl coreutils procps grep util-linux findutils cronie
+            apk update && apk add --no-cache curl coreutils procps grep util-linux findutils cronie bash
             rc-service crond start 2>/dev/null || systemctl start crond 2>/dev/null
+        elif [ -f /etc/debian_version ]; then
+            apt-get update -qq && apt-get install -y -qq curl coreutils procps util-linux findutils cron
+        elif [ -f /etc/redhat-release ]; then
+            yum install -y -q curl coreutils procps util-linux findutils cronie
         fi
-        [ -f /etc/debian_version ] && apt-get update -qq && apt-get install -y -qq curl coreutils procps util-linux findutils cron
-        [ -f /etc/redhat-release ] && yum install -y -q curl coreutils procps util-linux findutils cronie
     fi
-    if [ ! -f "$PAYLOAD_FILE" ] || [ $(stat -c%s "$PAYLOAD_FILE" 2>/dev/null || echo 0) -ne 104857600 ]; then
-        if command -v fallocate >/dev/null 2>&1; then
-            fallocate -l 100M "$PAYLOAD_FILE"
+
+    # 2. 智能载荷文件生成 (修复 No space left on device)
+    if [ ! -f "$PAYLOAD_FILE" ]; then
+        local created=0
+        # 尝试不同大小: 100MB -> 10MB -> 1MB
+        for size in 100 10 1; do
+            # 优先使用 fallocate (速度快)
+            if command -v fallocate >/dev/null 2>&1; then
+                if fallocate -l "${size}M" "$PAYLOAD_FILE" >/dev/null 2>&1; then
+                    created=1
+                    break
+                fi
+            fi
+            # 降级使用 dd (兼容性好)
+            if dd if=/dev/urandom of="$PAYLOAD_FILE" bs=1M count="$size" status=none >/dev/null 2>&1; then
+                created=1
+                break
+            fi
+        done
+        
+        if [ "$created" -eq 0 ]; then
+            UPLOAD_ENABLE=0
+            echo "警告: 磁盘空间不足，无法创建上传测试文件。上传功能已禁用。"
         else
-            dd if=/dev/urandom of="$PAYLOAD_FILE" bs=1M count=100 status=none
+            UPLOAD_ENABLE=1
         fi
+    else
+        UPLOAD_ENABLE=1
     fi
+
     find "$LOG_DIR" -name "traffic_cycle_*.log" -type f -mtime +14 -delete
 }
 
@@ -74,18 +106,18 @@ init_config() {
     if [ ! -f "$CONF_FILE" ]; then
         cat > "$CONF_FILE" <<EOF
 TARGET_DL=1666
-TARGET_UP=20
+TARGET_UP=30
 TARGET_FLOAT=10
-MAX_SPEED_DL=8
+MAX_SPEED_DL=7
 MAX_SPEED_UP=2
 SPEED_FLOAT=20
-ACTIVE_START=8
-ACTIVE_END=22
-CHUNK_MB=361
+ACTIVE_START=7
+ACTIVE_END=11
+CHUNK_MB=368
 CHUNK_FLOAT=20
 SKIP_CHANCE=20
-MAINT_TIME="03:30"
-CRON_DELAY_MIN=30
+MAINT_TIME="03:00"
+CRON_DELAY_MIN=20
 ROUND_LIMIT_GB=5
 EOF
     fi
@@ -159,6 +191,13 @@ get_valid_stats() {
 
 run_speedtest() {
     local type="$1"
+    
+    # 检查上传可用性
+    if [ "$type" == "UP" ] && [ "$UPLOAD_ENABLE" -eq 0 ]; then
+        echo "错误: 上传功能因磁盘空间不足已禁用。"
+        return
+    fi
+    
     local duration=10
     local start_time=$(date +%s)
     local end_time=$((start_time + duration))
@@ -198,23 +237,33 @@ run_traffic() {
     local target_mb="$3"
     local max_speed="$4"
     
+    # 检查上传可用性
+    if [ "$type" == "UP" ] && [ "$UPLOAD_ENABLE" -eq 0 ]; then
+        log "WARN" "$tag" "跳过上传任务: 磁盘空间不足"
+        return
+    fi
+    
     if [ "$tag" != "MANUAL" ]; then sleep $((RANDOM % 15 + 1)); fi
     
     local limit_args=()
     local real_kb=0
     
+    # 1. 随机速率锁定
     if [ "$max_speed" != "0" ]; then
         real_kb=$(calc_float "$((max_speed * 1024))" "$SPEED_FLOAT")
         [ "$real_kb" -lt 100 ] && real_kb=100
         limit_args=("--limit-rate" "${real_kb}k")
     fi
 
-    local target_bytes=$(awk "BEGIN {printf \"%.0f\", $target_mb * 1024 * 1024}")
+    # 2. 随机流量锁定 (切片波动)
+    # 实际目标 = 输入目标(切片基准) ± 波动
+    local actual_target_mb=$(calc_float "$target_mb" "$CHUNK_FLOAT")
+    local target_bytes=$(awk "BEGIN {printf \"%.0f\", $actual_target_mb * 1024 * 1024}")
     
     local spd_desc="无限制"
     if [ "$max_speed" != "0" ]; then spd_desc="$(awk "BEGIN {printf \"%.2f\", $real_kb/1024}") MB/s"; fi
     
-    log "INFO" "$tag" "任务启动 [$type] 目标:${target_mb}MB | 随机限速:$spd_desc"
+    log "INFO" "$tag" "任务启动 [$type] 计划:${actual_target_mb}MB (基准$target_mb) | 锁死速率:$spd_desc"
 
     local start_ts=$(date +%s)
     local cur_bytes=0
@@ -244,6 +293,7 @@ run_traffic() {
         if [ "$type" == "DL" ]; then
             url="${URL_DL_POOL[$((RANDOM % ${#URL_DL_POOL[@]}))]}"
             [[ "$url" == *"?"* ]] && url="$url&r=$RANDOM" || url="$url?r=$RANDOM"
+            # Range 精准控量
             local range_end=$((left_bytes - 1))
             cmd+=("-H" "Range: bytes=0-$range_end" "$url" "-w" "%{size_download}")
         else
@@ -264,7 +314,7 @@ run_traffic() {
              cur_bytes=$((cur_bytes + bytes))
         fi
         
-        [ "$tag" == "MANUAL" ] && echo -ne "\r进度: $((cur_bytes/1024/1024)) MB"
+        [ "$tag" == "MANUAL" ] && echo -ne "\r进度: $((cur_bytes/1024/1024)) MB / ${actual_target_mb} MB"
     done
     rm -f "$TEMP_METRIC"
     
@@ -327,11 +377,13 @@ entry_auto() {
     local round_total_mb=0
     
     if [ "$c_dl_mb" -lt "$dyn_dl" ]; then
-        local chunk=$(calc_float "$CHUNK_MB" "$CHUNK_FLOAT")
+
+        local chunk=$CHUNK_MB
         local left=$((dyn_dl - c_dl_mb))
         [ "$chunk" -gt "$left" ] && chunk=$left
         [ "$chunk" -lt 10 ] && chunk=10
         
+        # 熔断预判 (估算值)
         if [ $((round_total_mb + chunk)) -gt $((ROUND_LIMIT_GB * 1024)) ]; then chunk=$((ROUND_LIMIT_GB * 1024 - round_total_mb)); fi
         
         if [ "$chunk" -gt 0 ]; then
@@ -342,7 +394,7 @@ entry_auto() {
     
     if [ $((RANDOM % 100)) -lt 70 ] && [ "$c_up_mb" -lt "$dyn_up" ]; then
         if check_round_limit "$round_total_mb"; then
-            local chunk=$(calc_float "$((CHUNK_MB/4))" "$CHUNK_FLOAT")
+            local chunk=$((CHUNK_MB / 4))
             local left=$((dyn_up - c_up_mb))
             [ "$chunk" -gt "$left" ] && chunk=$left
             [ "$chunk" -lt 5 ] && chunk=5
@@ -390,7 +442,7 @@ entry_maint() {
     while [ "$gap" -gt 0 ]; do
         if ! check_round_limit "$round_total_mb"; then log "WARN" "MAINT" "触达每轮 ${ROUND_LIMIT_GB}GB 限额，停止"; break; fi
         
-        local chunk=$(calc_float "$CHUNK_MB" "$CHUNK_FLOAT")
+        local chunk=$CHUNK_MB
         [ "$chunk" -gt "$gap" ] && chunk=$gap
         
         run_traffic "MAINT" "DL" "$chunk" "$MAX_SPEED_DL"
@@ -425,14 +477,20 @@ setup_cron() {
     read cm ch <<< $(awk -v time="$MAINT_TIME" -v offset="$(unset TZ; date +%z)" 'BEGIN {
         split(time, t, ":");
         h = t[1]; m = t[2];
+        # 偏移量解析 (如 +0800 或 -0500)
         sign = (substr(offset,1,1)=="-") ? -1 : 1;
         oh = substr(offset,2,2);
         om = substr(offset,4,2);
         sys_off = sign * (oh*3600 + om*60);
+        
+        # 目标: 维护时间(UTC+8) -> 本地时间
+        # 公式: 本地 = 维护(UTC+8) - 28800 + 本地偏移
         target_sec = h*3600 + m*60;
         final = target_sec - 28800 + sys_off;
+        
         while (final < 0) final += 86400;
         while (final >= 86400) final -= 86400;
+        
         printf "%d %d", int((final%3600)/60), int(final/3600);
     }')
     
@@ -453,7 +511,7 @@ main_menu() {
         
         clear
         echo "================================================================"
-        echo "              VPS Traffic Spirit By Prince v1.0"
+        echo "               VPS Traffic Spirit By Prince v1.0"
         echo "================================================================"
         echo " [环境设置]"
         echo " 每日目标: DL $TARGET_DL MB | UP $TARGET_UP MB (浮动 $TARGET_FLOAT%)"
