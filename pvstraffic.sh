@@ -18,6 +18,8 @@ STATS_FILE="$BASE_DIR/history.db"
 TEMP_METRIC="/tmp/ts_metric_$$_${RANDOM}.tmp"
 
 DATE_BIN="date"
+DATE_STATUS="未知"
+UPLOAD_ENABLE=1
 
 readonly URL_DL_POOL=(
     "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.14.tar.xz"
@@ -46,53 +48,80 @@ readonly UA_POOL=(
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
 )
 
-check_basic_env() {
+check_env_passive() {
     mkdir -p "$BASE_DIR" "$LOG_DIR"
     
-    if [ -f "/usr/bin/date" ]; then DATE_BIN="/usr/bin/date"
+    if [ -f "/usr/bin/date" ]; then
+        DATE_BIN="/usr/bin/date"
+        DATE_STATUS="GNU (正常)"
     elif command -v date >/dev/null 2>&1; then
-        if ! date -d "now" >/dev/null 2>&1; then
-            echo "警告: 系统 date 不兼容 (BusyBox)。请手动安装 coreutils。"
+        if date -d "now" >/dev/null 2>&1; then
+            DATE_BIN="date"
+            DATE_STATUS="System (支持)"
+        else
+            DATE_BIN="date"
+            DATE_STATUS="BusyBox (需修复)"
         fi
+    else
+        DATE_STATUS="缺失 (严重)"
     fi
     find "$LOG_DIR" -name "traffic_cycle_*.log" -type f -mtime +14 -delete
 }
 
-check_system_health() {
-    # 保护机制：检查负载和内存
-    local load=$(cat /proc/loadavg | awk '{print $1}')
-    local is_overload=$(awk -v l="$load" 'BEGIN {if (l > 4.0) print 1; else print 0}')
+# 资源与空间检查 (返回 0=正常, 1=高负载/内存满, 2=空间不足)
+check_sys_resource() {
+    # 1. 检查空间 (仅针对上传前检查)
+    if [ "$1" == "check_disk" ]; then
+        local avail_kb=$(df -k "$BASE_DIR" | awk 'NR==2 {print $4}')
+        # 200MB = 204800KB
+        if [ "$avail_kb" -lt 204800 ]; then return 2; fi
+    fi
+
+    # 2. 检查 5分钟负载 (更平滑，避免瞬时误杀)
+    local load5=$(awk '{print $2}' /proc/loadavg 2>/dev/null)
+    # 如果获取不到(非Linux)，默认通过
+    if [ -z "$load5" ]; then return 0; fi
     
-    if [ "$is_overload" -eq 1 ]; then
-        echo "High Load"
+    # 阈值: 5分钟负载 > 4.0 视为高负载 (可根据核心数调整，此处为通用保护)
+    local cpu_warn=$(awk -v l="$load5" 'BEGIN {if (l > 4.0) print 1; else print 0}')
+    
+    # 3. 检查内存使用率
+    local mem_warn=0
+    if command -v free >/dev/null 2>&1; then
+        mem_warn=$(free | grep Mem | awk '{if ($3/$2 > 0.9) print 1; else print 0}')
+    fi
+
+    if [ "$cpu_warn" -eq 1 ] || [ "$mem_warn" -eq 1 ]; then
         return 1
     fi
     return 0
 }
 
-ensure_upload_capability() {
-    # 保护机制：卡顿熔断
-    if ! check_system_health; then
-        rm -f "$PAYLOAD_FILE"
-        return 2
+# 确保 Payload 可用 (仅在上传时调用)
+prepare_payload() {
+    # 1. 检查系统状态，如果是高负载，直接拒绝创建/上传
+    check_sys_resource "no_disk_check"
+    if [ $? -eq 1 ]; then
+        return 1 # 高负载跳过
     fi
 
-    if [ -f "$PAYLOAD_FILE" ]; then return 0; fi
-
-    # 空间检查 (需 > 200MB)
-    local avail_kb=$(df -k "$BASE_DIR" | awk 'NR==2 {print $4}')
-    if [ "$avail_kb" -lt 204800 ]; then
-        return 1
+    # 2. 检查空间，如果不足，清理文件并报警
+    check_sys_resource "check_disk"
+    if [ $? -eq 2 ]; then
+        if [ -f "$PAYLOAD_FILE" ]; then rm -f "$PAYLOAD_FILE"; fi
+        return 2 # 空间不足
     fi
 
-    # 创建文件
-    if command -v fallocate >/dev/null 2>&1; then
-        fallocate -l 100M "$PAYLOAD_FILE" >/dev/null 2>&1
-    elif command -v dd >/dev/null 2>&1; then
-        dd if=/dev/urandom of="$PAYLOAD_FILE" bs=1M count=100 status=none >/dev/null 2>&1
+    # 3. 如果文件不存在，则创建
+    if [ ! -f "$PAYLOAD_FILE" ]; then
+        if command -v fallocate >/dev/null 2>&1; then
+            fallocate -l 100M "$PAYLOAD_FILE" >/dev/null 2>&1
+        elif command -v dd >/dev/null 2>&1; then
+            dd if=/dev/urandom of="$PAYLOAD_FILE" bs=1M count=100 status=none >/dev/null 2>&1
+        fi
     fi
 
-    if [ -f "$PAYLOAD_FILE" ]; then return 0; else return 1; fi
+    if [ -f "$PAYLOAD_FILE" ]; then return 0; else return 3; fi
 }
 
 init_config() {
@@ -198,10 +227,11 @@ get_db_stats() {
 run_speedtest() {
     local type="$1"
     if [ "$type" == "UP" ]; then
-        ensure_upload_capability
+        prepare_payload
         local res=$?
-        if [ "$res" -eq 1 ]; then echo "错误: 空间不足，无法创建测试文件。"; return; fi
-        if [ "$res" -eq 2 ]; then echo "警告: 系统负载过高，强制取消上传。"; return; fi
+        if [ "$res" -eq 1 ]; then echo "警告: 系统负载过高，已暂缓上传测速。"; return; fi
+        if [ "$res" -eq 2 ]; then echo "错误: 磁盘空间不足，已清理缓存并停止上传。"; return; fi
+        if [ "$res" -eq 3 ]; then echo "错误: Payload 创建失败。"; return; fi
     fi
     
     local start_time=$(date +%s)
@@ -236,10 +266,10 @@ run_traffic() {
     local max_speed="$4"
     
     if [ "$direction" == "UP" ]; then
-        ensure_upload_capability
+        prepare_payload
         local res=$?
         if [ "$res" -ne 0 ]; then
-            log "WARN" "$task_tag" "上传受限 (代码 $res: 1=空间不足, 2=高负载)"
+            log "WARN" "$task_tag" "上传跳过 (代码 $res: 1=高负载, 2=无空间, 3=IO错误)"
             return
         fi
     fi
@@ -264,14 +294,6 @@ run_traffic() {
     
     while [ "$cur_bytes" -lt "$target_bytes" ]; do
         if [ "$task_tag" != "MANUAL" ] && [ $(( $(date +%s) - start_ts )) -gt 1800 ]; then break; fi
-        
-        # 实时熔断检测
-        if ! check_system_health; then
-            log "WARN" "$task_tag" "系统负载过高，中断任务"
-            [ "$direction" == "UP" ] && rm -f "$PAYLOAD_FILE"
-            break
-        fi
-
         local left_bytes=$((target_bytes - cur_bytes))
         if [ "$left_bytes" -le 0 ]; then break; fi
         
@@ -330,14 +352,19 @@ check_round_safe() {
 }
 
 entry_auto() {
-    check_basic_env; init_config
+    check_env_passive; init_config
     exec 9>"$LOCK_FILE"
     if ! flock -n 9; then exit 0; fi
     
     local h=$("$DATE_BIN" "+%H" | awk '{print int($0)}')
-    if [ "$h" -lt "$ACTIVE_START" ] || [ "$h" -ge "$ACTIVE_END" ]; then exit 0; fi
+    if [ "$h" -lt "$ACTIVE_START" ] || [ "$h" -ge "$ACTIVE_END" ]; then 
+        exit 0
+    fi
     sleep $((RANDOM % 60))
-    if [ $((RANDOM % 100)) -lt "$SKIP_CHANCE" ]; then exit 0; fi
+    if [ $((RANDOM % 100)) -lt "$SKIP_CHANCE" ]; then 
+        log "INFO" "AUTO" "随机跳过"
+        exit 0
+    fi
     
     local cycle_start=$(get_current_cycle_start)
     local now=$(date +%s)
@@ -371,7 +398,7 @@ entry_auto() {
 }
 
 entry_maint() {
-    check_basic_env; init_config
+    check_env_passive; init_config
     exec 9>"$LOCK_FILE"
     if ! flock -n 9; then exit 0; fi
     
@@ -426,7 +453,7 @@ entry_maint() {
 }
 
 setup_cron() {
-    check_basic_env
+    check_env_passive
     echo "正在配置 Cron..."
     read -p "检测间隔 (分钟, 默认10): " min
     [ -z "$min" ] && min=10
@@ -452,7 +479,7 @@ setup_cron() {
 
 main_menu() {
     while true; do
-        check_basic_env; init_config
+        check_env_passive; init_config
         local cycle_start=$(get_current_cycle_start)
         local now=$(date +%s)
         local last_cycle_start=$((cycle_start - 86400))
@@ -471,7 +498,7 @@ main_menu() {
         
         clear
         echo "================================================================"
-        echo "           VPS Traffic Spirit By Prince v1.0.0"
+        echo "            VPS Traffic Spirit By Prince v1.0.0"
         echo "================================================================"
         echo " [环境设置]"
         echo " 每日目标: DL $TARGET_DL MB | UP $TARGET_UP MB (浮动 $TARGET_FLOAT%)"
@@ -516,5 +543,5 @@ case "$1" in
     --auto) entry_auto ;;
     --maint) entry_maint ;;
     --manual-bg) run_traffic "MANUAL" "$2" "$3" "$4" ;;
-    *) check_basic_env; main_menu ;;
+    *) check_env_passive; main_menu ;;
 esac
