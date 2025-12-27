@@ -52,7 +52,7 @@ init_redirect_logging() {
     local today=$(date +%F)
     local log_file="$LOG_DIR/traffic_cycle_${today}.log"
     
-    # 将脚本的标准输出和错误输出重定向到日志文件
+    # 强制将脚本的标准输出和错误输出重定向到日志文件
     exec 1>>"$log_file"
     exec 2>&1
 }
@@ -142,7 +142,6 @@ log() {
     echo "[$(date "+%Y-%m-%d %H:%M:%S")] [$level] $msg"
 }
 
-# 核心修复：自动解除陈旧锁
 check_and_lock() {
     if [ -d "$LOCK_DIR" ]; then
         # 查找超过60分钟的锁目录并删除 (Self-Healing)
@@ -257,9 +256,7 @@ run_traffic() {
         log "INFO" "[$task_tag] 完成 $direction | 实跑 $final_mb MB"
         if [ "$task_tag" != "MANUAL" ]; then 
             local record_ts=$(date +%s)
-            
-            # 核心逻辑：如果是维护补量任务，时间戳强制为周期结束前1秒
-            # 这样这部分流量会永久计入"昨天"的账单
+
             if [ "$task_tag" == "MAINT" ]; then
                 local current_cycle_start=$(get_current_cycle_start)
                 record_ts=$((current_cycle_start - 1))
@@ -286,7 +283,7 @@ entry_auto() {
     init_config
     
     if ! check_and_lock; then
-        # 被锁住时不需要输出日志污染文件，直接静默退出
+
         exit 0
     fi
     
@@ -458,7 +455,7 @@ main_menu() {
         
         clear
         echo "================================================================"
-        echo "             VPS Traffic Spirit By Prince v1.0.0"
+        echo "            VPS Traffic Spirit By Prince v1.0.0"
         echo "================================================================"
         echo " [运行状态]"
         echo " 每日目标: DL $TARGET_DL MB | UP $TARGET_UP MB (浮动 $TARGET_FLOAT%)"
